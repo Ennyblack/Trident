@@ -336,3 +336,54 @@ groups:
             fires regardless of trend, so it also catches a sudden step in
             usage such as a backfill or a WAL pileup.
           runbook_url: "docs/runbooks/alerts.md#tridentdiskspacelow"
+
+  # ---------------------------------------------------------------------------
+  # Container resource saturation & OOM killer (#444)
+  # ---------------------------------------------------------------------------
+  - name: trident.container.resources
+    rules:
+      - alert: TridentContainerOOMKilled
+        expr: increase(kube_pod_container_status_terminated_reason{reason="OOMKilled"}[10m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+          service: infrastructure
+        annotations:
+          summary: "Container {{ $labels.container }} in pod {{ $labels.pod }} was OOM killed"
+          description: >
+            Container {{ $labels.container }} exceeded its memory limit and was terminated
+            by the kernel OOM killer. Check memory headroom and increase memory limits or tune GOMEMLIMIT.
+          runbook_url: "docs/runbooks/alerts.md#tridentcontaineroomkilled"
+
+      - alert: TridentContainerMemoryHigh
+        expr: >
+          container_memory_working_set_bytes{container=~"api|grpc-api|indexer"}
+            / container_spec_memory_limit_bytes{container=~"api|grpc-api|indexer"}
+            > 0.85
+        for: 5m
+        labels:
+          severity: warning
+          service: infrastructure
+        annotations:
+          summary: "Container {{ $labels.container }} memory usage > 85% of limit"
+          description: >
+            Container {{ $labels.container }} in pod {{ $labels.pod }} is at {{ $value | humanizePercentage }}
+            of its configured memory limit.
+          runbook_url: "docs/runbooks/alerts.md#tridentcontainermemoryhigh"
+
+      - alert: TridentContainerCPUThrottling
+        expr: >
+          increase(container_cpu_cfs_throttled_periods_total{container=~"api|grpc-api|indexer"}[5m])
+            / increase(container_cpu_cfs_periods_total{container=~"api|grpc-api|indexer"}[5m])
+            > 0.25
+        for: 10m
+        labels:
+          severity: warning
+          service: infrastructure
+        annotations:
+          summary: "Container {{ $labels.container }} CPU throttled > 25%"
+          description: >
+            Container {{ $labels.container }} in pod {{ $labels.pod }} is experiencing significant CPU throttling
+            under CFS quotas. Consider raising CPU limits or scaling out replicas.
+          runbook_url: "docs/runbooks/alerts.md#tridentcontainercputhrottling"
+
