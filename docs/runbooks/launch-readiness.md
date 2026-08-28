@@ -49,7 +49,7 @@ Run this immediately before launch and after every staging deploy.
 
 ## Webhook delivery guarantee
 
-Trident webhooks are at-least-once delivery. Events are first written to the event outbox, then delivery attempts are recorded in `webhook_deliveries`. A non-2xx response or network failure remains retryable until the retry budget is exhausted, after which the delivery is visible as a dead-lettered failure for operator review.
+Trident webhooks target at-least-once delivery. The indexer commits each event together with an `event_outbox` row in one transaction, and a relay publishes outbox rows to a Redis stream; delivery workers then consume with `XReadGroup` and record each attempt in `webhook_deliveries`. A non-2xx response or network failure remains retryable until the retry budget is exhausted, after which the delivery is visible as a dead-lettered failure for operator review. One caveat for launch: webhook retries are in-process, so a delivery-worker crash mid-retry strands the entry in the consumer group's pending list — no `XAutoClaim` recovery exists on that path yet. Dead-letter rows are pruned after 7 days, so replay is bounded by that window. See `docs/observability/event-delivery.md`.
 
 Ordering is best-effort per subscription while deliveries succeed on the first attempt. Retries can reorder events because a later event may be delivered before an earlier event finishes its retry schedule. Consumers must deduplicate by event id and treat delivery order as advisory.
 

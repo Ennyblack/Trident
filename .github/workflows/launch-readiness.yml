@@ -14,6 +14,10 @@ on:
 jobs:
   launch-readiness:
     runs-on: ubuntu-latest
+    # Fork pull requests do not receive repository secrets, so the staging
+    # checks below cannot run for external contributors. Skip rather than
+    # fail them: a permanently red required check is worse than no signal.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     env:
       STAGING_URL: ${{ vars.STAGING_URL }}
       STAGING_EXPLORER_URL: ${{ vars.STAGING_EXPLORER_URL }}
@@ -34,7 +38,14 @@ jobs:
       - name: Explorer accessibility and page-weight smoke
         run: |
           html=$(mktemp)
-          metrics=$(curl --silent --show-error --location --max-time 20 --write-out '%{http_code} %{time_total} %{size_download}' --output "$html" "$STAGING_EXPLORER_URL")
+          # Without this guard a timeout or DNS failure aborts the step under
+          # set -e with a bare exit code and no annotation explaining why.
+          rc=0
+          metrics=$(curl --silent --show-error --location --max-time 20 --write-out '%{http_code} %{time_total} %{size_download}' --output "$html" "$STAGING_EXPLORER_URL") || rc=$?
+          if [ "$rc" != "0" ]; then
+            echo "::error::Explorer request to $STAGING_EXPLORER_URL failed (curl exit ${rc})"
+            exit 1
+          fi
           read -r status seconds bytes <<< "$metrics"
           [ "$status" = "200" ] || { echo "::error::Explorer returned HTTP $status"; exit 1; }
           python3 - "$html" "$seconds" "$bytes" "$MAX_RESPONSE_MS" "$MAX_HTML_BYTES" <<'PY'
@@ -60,11 +71,19 @@ jobs:
           STAGING_API_KEY: ${{ secrets.STAGING_API_KEY }}
         run: |
           [ -n "$STAGING_API_KEY" ] || { echo "::error::Missing STAGING_API_KEY secret"; exit 1; }
-          curl --silent --show-error --fail --max-time 10 "$STAGING_URL/health" >/dev/null
+          curl --silent --show-error --fail --max-time 10 "$STAGING_URL/v1/health" >/dev/null
           curl --silent --show-error --fail --max-time 10 "$STAGING_URL/v1/ready" >/dev/null
-          curl --silent --show-error --fail --max-time 10 -H "X-API-Key: $STAGING_API_KEY" "$STAGING_URL/v1/events?contract_id=$STAGING_CONTRACT_ID&limit=1" | python3 -m json.tool >/dev/null
-          curl --silent --show-error --fail --max-time 8 -H "X-API-Key: $STAGING_API_KEY" "$STAGING_URL/v1/events/stream?contract_id=$STAGING_CONTRACT_ID" >/dev/null || code=$?
-          if [ "${code:-0}" != "0" ] && [ "${code:-0}" != "28" ]; then
+          curl --silent --show-error --fail --max-time 10 -H "X-API-Key: $STAGING_API_KEY" "$STAGING_URL/v1/events?contractId=$STAGING_CONTRACT_ID&limit=1" | python3 -m json.tool >/dev/null
+          # A healthy SSE stream holds the connection open, so curl must hit its
+          # --max-time and exit 28. Exit 0 means the server closed immediately,
+          # which is a broken stream, not a passing check.
+          code=0
+          curl --silent --show-error --fail --max-time 8 -H "X-API-Key: $STAGING_API_KEY" "$STAGING_URL/v1/events/stream?contractId=$STAGING_CONTRACT_ID" >/dev/null || code=$?
+          if [ "$code" = "0" ]; then
+            echo "::error::SSE stream closed immediately instead of staying open"
+            exit 1
+          fi
+          if [ "$code" != "28" ]; then
             echo "::error::SSE stream failed with curl exit ${code}"
             exit 1
           fi
