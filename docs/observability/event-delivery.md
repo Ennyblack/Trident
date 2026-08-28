@@ -101,3 +101,11 @@ Full rule definitions live in `observability/rpc-alerts.yml`:
 A Grafana dashboard covering latency percentiles, per-method/endpoint call
 volume, error rate by type, and active-endpoint/failover status is in
 `observability/dashboards/rpc-health.json`.
+
+## Public Webhook Delivery Guarantee
+
+Webhook delivery is at-least-once. The indexer commits events to the outbox before delivery workers attempt subscriber callbacks, and each attempt is recorded in `webhook_deliveries` with status and attempt metadata.
+
+Retries can reorder callbacks for the same subscription: if event A is retrying and event B succeeds immediately, consumers may observe B before A. Webhook consumers must deduplicate by event id and use ledger sequence plus event index when they need deterministic ordering.
+
+Operators should alert on three launch SLOs: delivery success ratio, dead-letter count, and outbox-to-delivered latency. A dead-lettered event is not silently dropped; it remains visible for replay or manual investigation.
