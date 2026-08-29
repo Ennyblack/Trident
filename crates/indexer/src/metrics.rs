@@ -40,6 +40,7 @@ pub const EFFECTIVE_POLL_INTERVAL_MS: &str = "trident_indexer_effective_poll_int
 pub const RPC_TIMEOUTS_TOTAL: &str = "trident_indexer_rpc_timeouts_total";
 pub const RPC_ACTIVE_ENDPOINT: &str = "trident_indexer_rpc_active_endpoint";
 pub const RPC_FAILOVERS_TOTAL: &str = "trident_indexer_rpc_failovers_total";
+pub const REORGS_TOTAL: &str = "trident_indexer_reorgs_total";
 /// Count of ScVal values that hit the catch-all / debug-format fallback in
 /// `scval_to_string` or `scval_to_json` (issue #415). A high rate means the
 /// indexer is encountering Soroban types it cannot render as structured data.
@@ -134,6 +135,10 @@ pub fn install(port: u16) -> Result<(), TridentError> {
     describe_counter!(
         RPC_FAILOVERS_TOTAL,
         "Times the indexer failed over to another RPC endpoint (issue #213)"
+    );
+    describe_counter!(
+        REORGS_TOTAL,
+        "Total number of ledger reorganisations / rollbacks detected and reconciled (issue #196)"
     );
     describe_gauge!(
         OUTBOX_BACKLOG,
@@ -316,6 +321,10 @@ pub fn record_dead_lettered() {
 
 pub fn record_unhandled_scvariant() {
     counter!(UNHANDLED_SCVARIANT_TOTAL).increment(1);
+}
+
+pub fn record_reorg() {
+    counter!(REORGS_TOTAL).increment(1);
 }
 
 pub fn record_poll_duration(seconds: f64) {

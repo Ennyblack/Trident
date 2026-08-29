@@ -498,10 +498,100 @@ impl Streamer {
         }
     }
 
+    /// Check for chain reorganisation / rollback before polling events (issue #196).
+    ///
+    /// Reorg conditions:
+    /// 1. `latest_ledger < *cursor`: The chain tip reported by RPC regressed behind our current cursor.
+    /// 2. Ledger hash mismatch: Compare recent stored ledger hashes from `ledger_metadata` against RPC `getLedgers`.
+    ///
+    /// If a reorg is detected:
+    /// - Verify that the rewind depth does not exceed `config.max_reorg_depth`.
+    /// - If it exceeds max depth, emit metric, log error, and return a fatal error.
+    /// - If within bounds, atomically delete affected rows, rewind cursor in `system_state`, update `*cursor`,
+    ///   record metric `metrics::record_reorg()`, and log structured warning.
+    async fn check_and_handle_reorg(&mut self, cursor: &mut u64) -> Result<(), TridentError> {
+        if *cursor == 0 {
+            return Ok(());
+        }
+
+        let latest_ledger = match self.rpc.get_latest_ledger().await {
+            Ok(seq) => seq,
+            Err(e) => {
+                tracing::debug!(error = %e, "Failed to fetch latest ledger for reorg check; will check on next poll");
+                return Ok(());
+            }
+        };
+
+        let mut reorg_start: Option<u64> = None;
+
+        // Condition 1: Chain tip regressed behind current cursor
+        if latest_ledger < *cursor {
+            reorg_start = Some(latest_ledger + 1);
+        } else {
+            // Condition 2: Check stored ledger hashes against RPC for recent ledgers
+            let check_count = (self.config.max_reorg_depth.min(10)) as i64;
+            let recent_ledgers = db::get_recent_ledger_metadata(&self.db, check_count).await?;
+
+            for (seq, stored_hash) in recent_ledgers {
+                if let Ok(Some(rpc_hash)) = self.rpc.get_ledger(seq).await {
+                    if rpc_hash != stored_hash {
+                        tracing::warn!(
+                            sequence = seq,
+                            stored_hash = %stored_hash,
+                            rpc_hash = %rpc_hash,
+                            "Ledger hash mismatch detected indicating reorg"
+                        );
+                        reorg_start = Some(match reorg_start {
+                            Some(existing) => existing.min(seq),
+                            None => seq,
+                        });
+                    }
+                }
+            }
+        }
+
+        if let Some(reorg_seq) = reorg_start {
+            let reorg_depth = cursor.saturating_sub(reorg_seq) + 1;
+
+            if reorg_depth > self.config.max_reorg_depth {
+                metrics::record_reorg();
+                tracing::error!(
+                    reorg_start = reorg_seq,
+                    cursor = *cursor,
+                    reorg_depth = reorg_depth,
+                    max_reorg_depth = self.config.max_reorg_depth,
+                    "Deep ledger reorganisation detected exceeding maximum allowed depth; halting indexer"
+                );
+                return Err(TridentError::indexer(anyhow::anyhow!(
+                    "Deep reorg of depth {} exceeds max allowed depth {}",
+                    reorg_depth,
+                    self.config.max_reorg_depth
+                )));
+            }
+
+            let new_cursor = reorg_seq.saturating_sub(1);
+            tracing::warn!(
+                reorg_start = reorg_seq,
+                cursor_before = *cursor,
+                new_cursor = new_cursor,
+                reorg_depth = reorg_depth,
+                "Ledger reorganisation detected; rolling back affected ledger data and rewinding cursor"
+            );
+
+            metrics::record_reorg();
+            db::handle_reorg_rollback(&self.db, reorg_seq, new_cursor).await?;
+            *cursor = new_cursor;
+        }
+
+        Ok(())
+    }
+
     /// Execute a single poll cycle. Fetches all available pages from the RPC
     /// starting at `cursor`, persists each event, and advances the cursor.
     /// Returns the total number of events processed in this cycle.
     async fn poll_once(&mut self, cursor: &mut u64) -> Result<usize, TridentError> {
+        self.check_and_handle_reorg(cursor).await?;
+
         let poll_start = Instant::now();
         // Cursor and lag as this cycle begins, so catch-up throughput can be
         // measured over the cycle (issue #420). `last_chain_tip` is the tip
@@ -2322,6 +2412,128 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(count_b.0, 1, "CTEST_B should have 1 event (ledger 250)");
+
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn reorg_detection_and_rollback_removes_stale_data() {
+        let (db_url, redis_url) = require_services!();
+        let server = MockServer::start().await;
+
+        let pool = sqlx::PgPool::connect(&db_url).await.unwrap();
+        reset_db(&pool).await;
+
+        // Seed old events and ledger metadata at sequence 101 and 102 with cursor at 102
+        sqlx::query(
+            r#"
+            INSERT INTO ledger_metadata (ledger_sequence, ledger_hash, ledger_timestamp, event_count)
+            VALUES (100, 'hash100', '2024-01-01T00:00:00Z', 1),
+                   (101, 'old_hash101', '2024-01-01T00:00:05Z', 1),
+                   (102, 'old_hash102', '2024-01-01T00:00:10Z', 1)
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            r#"
+            INSERT INTO soroban_events (id, contract_id, ledger_sequence, ledger_timestamp, transaction_hash, event_index, topic_json, value_json, raw_payload)
+            VALUES ('00000000-0000-0000-0000-000000000101', 'CDEMO', 101, '2024-01-01T00:00:05Z', 'tx101', 0, '[]', '{}', 'raw'),
+                   ('00000000-0000-0000-0000-000000000102', 'CDEMO', 102, '2024-01-01T00:00:10Z', 'tx102', 0, '[]', '{}', 'raw')
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query("UPDATE system_state SET value = '102' WHERE key = 'latest_ledger_cursor'")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // Mock RPC latest ledger as 100 (indicating rollback of 101 & 102)
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .and(body_partial_json(serde_json::json!({ "method": "getLatestLedger" })))
+            .respond_with(rpc_ok(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": { "sequence": 100 }
+            })))
+            .mount(&server)
+            .await;
+
+        // Mock getLedgers
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .and(body_partial_json(serde_json::json!({ "method": "getLedgers" })))
+            .respond_with(rpc_ok(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": { "ledgers": [] }
+            })))
+            .mount(&server)
+            .await;
+
+        // Mock getEvents returning empty to complete poll
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .and(body_partial_json(serde_json::json!({ "method": "getEvents" })))
+            .respond_with(rpc_ok(events_page(100, 0)))
+            .mount(&server)
+            .await;
+
+        let mut s = make_streamer(&db_url, &redis_url, server.uri()).await;
+        let mut cursor = 102u64;
+
+        s.poll_once(&mut cursor).await.unwrap();
+
+        // Verify cursor was rewound to 100
+        assert_eq!(cursor, 100, "cursor should be rewound to reorg tip 100");
+
+        // Verify old stale events and metadata from 101 & 102 are deleted
+        let count_events: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM soroban_events WHERE ledger_sequence > 100")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count_events.0, 0, "stale soroban_events from reorged ledgers must be deleted");
+
+        let count_meta: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM ledger_metadata WHERE ledger_sequence > 100")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count_meta.0, 0, "stale ledger_metadata from reorged ledgers must be deleted");
+
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn deep_reorg_exceeding_max_depth_halts_with_error() {
+        let (db_url, redis_url) = require_services!();
+        let server = MockServer::start().await;
+
+        let pool = sqlx::PgPool::connect(&db_url).await.unwrap();
+        reset_db(&pool).await;
+
+        // Mock RPC latest ledger as 100 when cursor is 500 (depth 400 > max_reorg_depth 128)
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .and(body_partial_json(serde_json::json!({ "method": "getLatestLedger" })))
+            .respond_with(rpc_ok(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": { "sequence": 100 }
+            })))
+            .mount(&server)
+            .await;
+
+        let mut s = make_streamer(&db_url, &redis_url, server.uri()).await;
+        let mut cursor = 500u64;
+
+        let result = s.poll_once(&mut cursor).await;
+        assert!(result.is_err(), "deep reorg exceeding max_reorg_depth must return Err");
 
         pool.close().await;
     }
