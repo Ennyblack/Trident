@@ -1,7 +1,9 @@
 // Issue #520: use a published SDK the way a real user would, not internal
 // APIs. This module now goes through @trident-indexer/sdk's TridentClient
-// (real retry/backoff, Zod response validation, typed errors) instead of a
-// hand-rolled fetchWithTimeout — the SDK is not yet published to npm, so
+// (real retry/backoff, Zod response validation, typed errors, and a
+// per-attempt timeout) instead of a hand-rolled fetchWithTimeout — the
+// timeout the wrapper used to enforce now lives in the SDK itself, so every
+// SDK consumer gets it rather than just this app. The SDK is not published to npm yet, so
 // package.json references it via a local `file:` dependency
 // (file:../sdk/typescript) until it is; swap that for a real version range
 // once #517/#429 land a published release.
@@ -27,6 +29,14 @@ const MAINNET_URL =
   import.meta.env.TRIDENT_MAINNET_API_URL ?? "https://api.mainnet.trident.dev";
 const API_KEY: string = import.meta.env.EXPLORER_API_KEY ?? "";
 
+/**
+ * Per-request timeout handed to the SDK. Pages render this figure in their
+ * timeout error state, so it is exported rather than duplicated as a literal —
+ * the previous hand-rolled client hardcoded 30s in both places and the two
+ * drifted apart the moment the fetch wrapper was replaced.
+ */
+export const TRIDENT_TIMEOUT_MS = 30_000;
+
 function apiUrlFor(network: Network): string {
   return network === "mainnet" ? MAINNET_URL : TESTNET_URL;
 }
@@ -41,6 +51,7 @@ function clientFor(network: Network): TridentClient {
     apiUrl: apiUrlFor(network),
     apiKey: API_KEY || undefined,
     network,
+    timeoutMs: TRIDENT_TIMEOUT_MS,
   });
   clientCache.set(network, client);
   return client;
