@@ -33,7 +33,11 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          # Astro 7 refuses to run on anything below 22.12 ("Node.js v20.x is
+          # not supported by Astro"). Pinned at 20, this job failed before it
+          # compiled a line — the workflow added to catch a broken explorer
+          # build could not itself run.
+          node-version: "22.12"
 
       - name: Build the TypeScript SDK
         working-directory: sdk/typescript

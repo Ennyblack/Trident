@@ -1126,7 +1126,10 @@ jobs:
       - name: Checklist table is still parseable
         run: |
           set -euo pipefail
-          out=$(bash scripts/check-launch-gate.sh || true)
+          # 2>&1 matters: the NO-GO verdict is written to stderr (it is the
+          # failure path), so capturing stdout alone loses the RESULT line the
+          # assertions below look for.
+          out=$(bash scripts/check-launch-gate.sh 2>&1 || true)
           echo "$out"
           if echo "$out" | grep -q "no gate rows found"; then
             echo "::error::the launch checklist table is no longer parseable by check-launch-gate.sh"
