@@ -1,3 +1,24 @@
+// Issue #520: use a published SDK the way a real user would, not internal
+// APIs. This module now goes through @trident-indexer/sdk's TridentClient
+// (real retry/backoff, Zod response validation, typed errors) instead of a
+// hand-rolled fetchWithTimeout — the SDK is not yet published to npm, so
+// package.json references it via a local `file:` dependency
+// (file:../sdk/typescript) until it is; swap that for a real version range
+// once #517/#429 land a published release.
+//
+// The SDK's own types are camelCase (contractId, ledgerSequence, ...) to
+// match its own conventions, while every .astro page in this app was
+// written against the raw REST API's snake_case JSON shape (contract_id,
+// ledger_sequence, ...). Translating at this one boundary — rather than
+// migrating every field access across index.astro, contract/[address]/
+// index.astro, and contract/[address]/event/[id].astro (including inline
+// client-side <script> blocks that re-fetch this same shape from
+// /api/events.json) — gets the real behavioral benefit (actual retry
+// logic, actual response validation) without a large, higher-risk
+// find-and-rename across presentation code this session can't visually
+// verify rendered correctly.
+
+import { TridentClient, type SorobanEvent as SdkSorobanEvent } from "@trident-indexer/sdk";
 import type { SorobanEvent, ListEventsResponse, Network } from "./types";
 
 const TESTNET_URL =
@@ -5,16 +26,39 @@ const TESTNET_URL =
 const MAINNET_URL =
   import.meta.env.TRIDENT_MAINNET_API_URL ?? "https://api.mainnet.trident.dev";
 const API_KEY: string = import.meta.env.EXPLORER_API_KEY ?? "";
-const API_TIMEOUT = 30000; // 30 second timeout
 
-function baseUrl(network: Network): string {
+function apiUrlFor(network: Network): string {
   return network === "mainnet" ? MAINNET_URL : TESTNET_URL;
 }
 
-function authHeaders(): HeadersInit {
-  const h: Record<string, string> = {};
-  if (API_KEY) h["X-API-Key"] = API_KEY;
-  return h;
+const clientCache = new Map<Network, TridentClient>();
+
+function clientFor(network: Network): TridentClient {
+  const cached = clientCache.get(network);
+  if (cached) return cached;
+
+  const client = new TridentClient({
+    apiUrl: apiUrlFor(network),
+    apiKey: API_KEY || undefined,
+    network,
+  });
+  clientCache.set(network, client);
+  return client;
+}
+
+function toSnakeCaseEvent(event: SdkSorobanEvent): SorobanEvent {
+  return {
+    id: event.id,
+    contract_id: event.contractId,
+    ledger_sequence: event.ledgerSequence,
+    ledger_timestamp: event.ledgerTimestamp,
+    transaction_hash: event.transactionHash,
+    event_index: event.eventIndex,
+    event_type: event.eventType,
+    topics: event.topics,
+    data: typeof event.data === "string" ? event.data : JSON.stringify(event.data),
+    created_at: event.createdAt,
+  };
 }
 
 export interface QueryEventsParams {
@@ -27,57 +71,33 @@ export interface QueryEventsParams {
   network?: Network;
 }
 
-async function fetchWithTimeout(
-  url: string,
-  options: RequestInit = {},
-  timeoutMs = API_TIMEOUT,
-): Promise<Response> {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), timeoutMs);
-
-  try {
-    const res = await fetch(url, {
-      ...options,
-      signal: controller.signal,
-    });
-    return res;
-  } finally {
-    clearTimeout(timeout);
-  }
-}
-
 export async function listEvents(
   params: QueryEventsParams = {},
 ): Promise<ListEventsResponse> {
   const network: Network = params.network ?? "testnet";
-  const url = new URL(`${baseUrl(network)}/v1/events`);
-  if (params.contractId) url.searchParams.set("contractId", params.contractId);
-  if (params.topic0) url.searchParams.set("topic0", params.topic0);
-  if (params.ledgerFrom != null)
-    url.searchParams.set("ledgerFrom", String(params.ledgerFrom));
-  if (params.ledgerTo != null)
-    url.searchParams.set("ledgerTo", String(params.ledgerTo));
-  if (params.cursor) url.searchParams.set("cursor", params.cursor);
-  url.searchParams.set("limit", String(params.limit ?? 25));
+  const client = clientFor(network);
 
-  const res = await fetchWithTimeout(url.toString(), {
-    headers: authHeaders(),
+  const result = await client.queryEvents({
+    contractId: params.contractId,
+    topic0: params.topic0,
+    ledgerFrom: params.ledgerFrom,
+    ledgerTo: params.ledgerTo,
+    after: params.cursor,
+    limit: params.limit ?? 25,
   });
-  if (!res.ok) throw new Error(`API ${res.status}`);
-  return (await res.json()) as ListEventsResponse;
+
+  return {
+    events: result.events.map(toSnakeCaseEvent),
+    has_more: result.hasMore,
+    next_cursor: result.cursor,
+  };
 }
 
 export async function getEvent(
   id: string,
   network: Network = "testnet",
 ): Promise<SorobanEvent> {
-  const res = await fetchWithTimeout(
-    `${baseUrl(network)}/v1/events/${encodeURIComponent(id)}`,
-    {
-      headers: authHeaders(),
-    },
-  );
-  if (!res.ok) throw new Error(`API ${res.status}`);
-  const body = (await res.json()) as { event: SorobanEvent };
-  return body.event;
+  const client = clientFor(network);
+  const event = await client.getEventById({ id });
+  return toSnakeCaseEvent(event);
 }
