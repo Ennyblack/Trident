@@ -13,7 +13,7 @@ Public event explorer for Soroban contracts on Stellar. Read-only, no API key re
 | Path | Description |
 |------|-------------|
 | `/` | Landing page — search + live recent events ticker |
-| `/contract/:address` | All events for a contract, paginated. Table and every query-dependent state render client-side over an API route so slow queries show a deliberate skeleton |
+| `/contract/:address` | All events for a contract, server-rendered with pagination + filters. Distinct error/empty states, plus a live SSE feed (status pill + auto-reconnect) |
 | `/contract/:address/event/:id` | Single event detail, shareable, og:tags |
 | `/api/events.json` | Events API with classified result states (see below) |
 | `/api/events/stream` | Server-side SSE proxy for the live feed (keeps `EXPLORER_API_KEY` and the `Last-Event-ID` handshake private) |
@@ -47,7 +47,7 @@ The `EXPLORER_API_KEY` is used server-side only and is never sent to the browser
 
 The explorer distinguishes failures deliberately instead of showing blank pages or raw errors:
 
-- **Loading**: queries that take longer than ~300ms show a content skeleton, never an empty wait.
+- **Loading**: the homepage ticker shows a content skeleton while the recent-events feed loads, never an empty wait.
 - **No events yet**: the contract is quiet (and being watched live), so nothing is missed.
 - **Not indexed yet**: the contract is emitting on-chain events but Trident hasn't indexed them — shown only after a best-effort Soroban RPC probe confirms the contract is live.
 - **Invalid contract**: the searched address fails the Stellar strkey format + checksum check, answered locally in milliseconds.

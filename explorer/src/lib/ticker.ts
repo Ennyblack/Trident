@@ -59,12 +59,13 @@ function rowHtml(e: TickerEvent): string {
   return `
     <li class="flex items-center gap-4 bg-gray-900 rounded-lg px-4 py-2.5 text-sm hover:bg-gray-800 transition-colors">
       <a href="/contract/${encodeURIComponent(e.contract_id)}?network=${network}"
-         class="font-mono text-indigo-400 hover:text-indigo-300 truncate shrink-0 w-36"
+         class="font-mono text-indigo-300 hover:text-indigo-200 truncate shrink-0 w-36 focus:outline-none focus:ring-2 focus:ring-indigo-500 rounded underline underline-offset-2"
          title="${esc(e.contract_id)}">${esc(truncate(e.contract_id))}</a>
       <span class="text-gray-300 truncate flex-1">${esc(e.topics[0] ?? e.event_type)}</span>
       <span class="text-gray-500 text-xs shrink-0 hidden sm:block" title="${esc(e.ledger_timestamp)}">${esc(relativeTime(e.ledger_timestamp))}</span>
       <a href="/contract/${encodeURIComponent(e.contract_id)}/event/${encodeURIComponent(e.id)}?network=${network}"
-         class="text-xs text-gray-500 hover:text-white shrink-0" aria-label="View event ${esc(e.id)}">#${e.ledger_sequence}</a>
+         class="text-xs text-gray-500 hover:text-white shrink-0 focus:outline-none focus:ring-2 focus:ring-indigo-500 rounded"
+         aria-label="View event ${esc(e.id)} at ledger ${e.ledger_sequence}">#${e.ledger_sequence}</a>
     </li>`.trim();
 }
 
@@ -147,7 +148,7 @@ function bindTickerRetry(): void {
 bindTickerRetry();
 void pollTicker(true);
 
-const id = window.setInterval(() => void pollTicker(), 5000);
+const id = window.setInterval(() => void pollTicker(), 10000);
 document.addEventListener('visibilitychange', () => {
   if (document.hidden) window.clearInterval(id);
 });
