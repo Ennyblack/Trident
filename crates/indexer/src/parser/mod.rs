@@ -318,6 +318,7 @@ pub fn scval_to_string(val: &ScVal) -> String {
         // For complex types in topic position, fall back to debug representation
         other => {
             crate::metrics::record_unhandled_scvariant();
+            tracing::warn!(variant = ?other, "unhandled ScVal variant encountered in topic");
             format!("{other:?}")
         }
     }
@@ -383,6 +384,7 @@ pub fn scval_to_json(val: &ScVal) -> Json {
         ScVal::Map(None) => Json::Object(serde_json::Map::new()),
         other => {
             crate::metrics::record_unhandled_scvariant();
+            tracing::warn!(variant = ?other, "unhandled ScVal variant encountered in body");
             Json::String(format!("{other:?}"))
         }
     }
