@@ -16,6 +16,7 @@
   "dependencies": {
     "@astrojs/node": "^11.1.4",
     "@astrojs/tailwind": "^6.0.2",
+    "@trident-indexer/sdk": "file:../sdk/typescript",
     "astro": "^7.2.9",
     "tailwindcss": "^3.4.13"
   },
