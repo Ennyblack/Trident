@@ -61,7 +61,12 @@ fi
 # Extract table rows: lines starting with "| <digit>" are gate rows; the
 # header and separator rows start with "| #" and "|---" respectively and are
 # excluded by requiring the first cell to be numeric.
-mapfile -t GATE_ROWS < <(command grep -E '^\| *[0-9]+ *\|' "$CHECKLIST" || true)
+# `mapfile` is bash 4+; macOS still ships bash 3.2 and this script is
+# documented for local pre-launch runs, so read the rows portably instead.
+GATE_ROWS=()
+while IFS= read -r _gate_row; do
+  GATE_ROWS+=("$_gate_row")
+done < <(command grep -E '^\| *[0-9]+ *\|' "$CHECKLIST" || true)
 
 if [ "${#GATE_ROWS[@]}" -eq 0 ]; then
   echo "ERROR: no gate rows found in $CHECKLIST — table format may have changed" >&2
@@ -76,6 +81,7 @@ echo ""
 
 FAILURES=0
 ROLLBACK_ROW=""
+ROLLBACK_ROW_FOUND=0
 
 # Split a markdown table row into its cells (fields between the pipes),
 # trimming surrounding whitespace from each.
@@ -84,11 +90,18 @@ split_row() {
   # Strip leading/trailing pipe, then split on remaining pipes.
   row="${row#|}"
   row="${row%|}"
+  # A markdown-escaped `\|` is literal cell text, not a column separator.
+  # Splitting on it would shift every later column by one and misreport a
+  # valid row (e.g. a gate description containing a pipe). Swap escaped pipes
+  # for a sentinel before splitting, then restore them per cell.
+  local sentinel=$'\001'
+  row="${row//\\|/$sentinel}"
   IFS='|' read -r -a CELLS <<< "$row"
   local i
   for i in "${!CELLS[@]}"; do
-    # Trim leading/trailing whitespace from each cell.
-    CELLS[i]="$(echo "${CELLS[i]}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+    # Trim leading/trailing whitespace from each cell, then restore pipes.
+    CELLS[i]="$(printf '%s' "${CELLS[i]}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+    CELLS[i]="${CELLS[i]//$sentinel/|}"
   done
 }
 
@@ -101,6 +114,16 @@ for row in "${GATE_ROWS[@]}"; do
   signoff="${CELLS[4]:-}"
 
   label="Row ${num}: ${gate}"
+
+  # Track the rollback rehearsal row (matched by name, not a hardcoded row
+  # number, so reordering the table doesn't silently stop checking staleness).
+  # Done before the status checks below because those `continue` on a blank
+  # Pass/Fail cell — which is exactly the state of an unexecuted checklist,
+  # and would otherwise report the row as missing entirely.
+  if [[ "$gate" == *"Rollback rehearsed"* ]]; then
+    ROLLBACK_ROW_FOUND=1
+    ROLLBACK_ROW="$evidence"
+  fi
 
   if [ -z "$status" ]; then
     echo "NO-GO: ${label} — Pass/Fail column is blank"
@@ -127,16 +150,17 @@ for row in "${GATE_ROWS[@]}"; do
       ;;
   esac
 
-  # Track the rollback rehearsal row (matched by name, not a hardcoded row
-  # number, so reordering the table doesn't silently stop checking staleness).
-  if [[ "$gate" == *"Rollback rehearsed"* ]]; then
-    ROLLBACK_ROW="$evidence"
-  fi
 done
 
 echo ""
 echo "=== Rollback rehearsal staleness ==="
-if [ -z "$ROLLBACK_ROW" ]; then
+if [ "$ROLLBACK_ROW_FOUND" -eq 0 ]; then
+  # Distinguished from "row present but blank": the staleness check binds to
+  # the table by the gate's name, so a renamed row would otherwise be reported
+  # as missing evidence and send someone hunting for the wrong problem.
+  echo "NO-GO: no gate row matching 'Rollback rehearsed' found — if it was renamed, update the match in this script"
+  FAILURES=$((FAILURES + 1))
+elif [ -z "$ROLLBACK_ROW" ]; then
   echo "NO-GO: rollback rehearsal row has no evidence recorded (cannot verify it happened within 30 days)"
   FAILURES=$((FAILURES + 1))
 else
