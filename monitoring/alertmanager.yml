@@ -59,23 +59,45 @@ route:
       continue: false
 
 receivers:
-  # TODO(#445): point this at the actual named on-call owner's paging tool
-  # once #445 lands (PagerDuty/Opsgenie/etc. — pagerduty_configs shown as the
-  # placeholder shape; swap for whichever tool #445 decides on). Until then
-  # this receiver exists and every critical alert is already routed to it —
-  # only the delivery target inside it needs to change.
+  # Delivery is real, not a placeholder. A receiver with no *_configs is a
+  # VALID Alertmanager config that accepts every notification and discards it,
+  # so commented-out integrations here would make `on-call-critical`
+  # behaviourally identical to `default-null`: `amtool check-config` passes,
+  # the routing tree looks correct, and nobody is ever paged. That failure is
+  # silent and only discovered during the incident it was meant to catch.
+  #
+  # #445 (naming the on-call owner) is still open, so the paging *identity*
+  # is supplied at deploy time via envsubst rather than invented here:
+  #
+  #   PAGERDUTY_ROUTING_KEY=<key> SLACK_WEBHOOK_URL=<url> \
+  #     envsubst < monitoring/alertmanager.yml > /etc/alertmanager/config.yml
+  #
+  # Both variables are REQUIRED — Alertmanager rejects an empty routing_key
+  # and an empty Slack api_url at startup, so a deploy that forgets them fails
+  # loudly at boot instead of coming up healthy and paging into a void. That
+  # is the intended behaviour: no on-call target configured should stop the
+  # deploy, not silently disable alerting. Once #445 names the owner, replace
+  # the two variables with that team's real values and drop the envsubst step.
   - name: on-call-critical
-    # pagerduty_configs:
-    #   - routing_key: "${PAGERDUTY_ROUTING_KEY}"
-    #     description: '{{ .CommonAnnotations.summary }}'
-    #     details:
-    #       runbook_url: '{{ .CommonAnnotations.runbook_url }}'
+    pagerduty_configs:
+      - routing_key: "${PAGERDUTY_ROUTING_KEY}"
+        description: '{{ .CommonAnnotations.summary }}'
+        severity: critical
+        details:
+          alertname: '{{ .CommonLabels.alertname }}'
+          service: '{{ .CommonLabels.service }}'
+          runbook_url: '{{ .CommonAnnotations.runbook_url }}'
+        send_resolved: true
 
   - name: on-call-warning
-    # slack_configs:
-    #   - api_url: "${SLACK_WEBHOOK_URL}"
-    #     channel: "#trident-alerts"
-    #     title: '{{ .CommonAnnotations.summary }}'
+    slack_configs:
+      - api_url: "${SLACK_WEBHOOK_URL}"
+        channel: "#trident-alerts"
+        title: '{{ .CommonAnnotations.summary }}'
+        text: >-
+          {{ .CommonAnnotations.description }}
+          {{ with .CommonAnnotations.runbook_url }}Runbook: {{ . }}{{ end }}
+        send_resolved: true
 
   # Alertmanager requires every route to resolve to a defined receiver, even
   # one that intentionally does nothing — this is that intentional sink, not
