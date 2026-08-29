@@ -73,8 +73,19 @@ jobs:
           node dist/server/entry.mjs &
           SERVER_PID=$!
           for i in $(seq 1 20); do
-            if curl --silent --fail --max-time 1 "http://127.0.0.1:4321/" >/dev/null 2>&1; then
-              echo "Server responded successfully"
+            # localhost, not 127.0.0.1: @astrojs/node binds the hostname and
+            # on a dual-stack runner that can be ::1 only, so the v4 literal
+            # never connects.
+            #
+            # No --fail, and any HTTP status counts. This step verifies the
+            # built server boots and serves — not that the page renders
+            # successfully. Rendering "/" calls the real testnet API with a
+            # dummy key, so a non-2xx here is the expected, correct outcome;
+            # requiring 2xx made the check depend on a live external service.
+            code=$(curl --silent --show-error --max-time 2 -o /dev/null -w '%{http_code}' \
+              "http://localhost:4321/" 2>/dev/null || echo "000")
+            if [ "$code" != "000" ]; then
+              echo "Server responded with HTTP $code"
               kill "$SERVER_PID"
               exit 0
             fi
