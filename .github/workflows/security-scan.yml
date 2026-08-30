@@ -142,6 +142,15 @@ jobs:
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
 
+      # audit-check installs cargo-audit itself without --locked, which
+      # resolves its dependencies to their newest releases. kstring 2.0.4 now
+      # requires rustc 1.96 while the stable runner is on 1.94, so that
+      # unpinned build fails before the audit ever runs. Installing it here
+      # with --locked uses cargo-audit's own lockfile, which builds on
+      # stable; the action reuses the binary it finds on PATH.
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked --version ^0.22
+
       - name: cargo audit (Rust workspace)
         uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
         with:
