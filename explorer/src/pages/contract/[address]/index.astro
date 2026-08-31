@@ -1,11 +1,12 @@
 ---
 import Base from '../../../layouts/Base.astro';
 import ErrorState from '../../../components/ErrorState.astro';
-import EmptyState from '../../../components/EmptyState.astro';
-import { listEvents, TRIDENT_TIMEOUT_MS } from '../../../lib/api';
+import { isValidContractId } from '../../../lib/contracts';
+import { listEvents } from '../../../lib/api';
+import { probeContractOnChain } from '../../../lib/soroban';
 import { truncate, relativeTime, stellarExpertBase, tryFormatJson } from '../../../lib/format';
-import { ErrorType, getErrorState, classifyError } from '../../../lib/errors';
-import { TridentApiError, TridentError } from '@trident-indexer/sdk';
+import { ErrorType, getErrorState } from '../../../lib/errors';
+import type { ErrorState as ErrorStateType } from '../../../lib/errors';
 import type { Network, SorobanEvent } from '../../../lib/types';
 
 const { address } = Astro.params as { address: string };
@@ -15,36 +16,81 @@ const topic0Filter = Astro.url.searchParams.get('topic0') ?? '';
 const ledgerFrom = Astro.url.searchParams.get('ledgerFrom') ?? '';
 const ledgerTo = Astro.url.searchParams.get('ledgerTo') ?? '';
 const cursor = Astro.url.searchParams.get('cursor') ?? '';
+const filtered = Boolean(topic0Filter || ledgerFrom || ledgerTo);
 
 let events: SorobanEvent[] = [];
 let hasMore = false;
 let nextCursor: string | null = null;
-let errorState = null as ReturnType<typeof getErrorState> | null;
+let errorState = null as ErrorStateType | null;
 
-try {
-  const result = await listEvents({
-    contractId: address,
-    network,
-    topic0: topic0Filter || undefined,
-    ledgerFrom: ledgerFrom ? Number(ledgerFrom) : undefined,
-    ledgerTo: ledgerTo ? Number(ledgerTo) : undefined,
-    cursor: cursor || undefined,
-    limit: 25,
-  });
-  
-  events = result.events;
-  hasMore = result.has_more;
-  nextCursor = result.next_cursor;
+if (!isValidContractId(address)) {
+  errorState = {
+    type: ErrorType.NOT_FOUND,
+    title: "That doesn't look like a Stellar contract address",
+    message:
+      'A Soroban contract address is a 56-character string starting with C (for example C…) and ends in a valid checksum. Double-check for typos, copy the full address, and search again.',
+    actionText: 'Back to search',
+    actionUrl: '/',
+    retryable: false,
+  };
+} else {
+  try {
+    const result = await listEvents({
+      contractId: address,
+      network,
+      topic0: topic0Filter || undefined,
+      ledgerFrom: ledgerFrom ? Number(ledgerFrom) : undefined,
+      ledgerTo: ledgerTo ? Number(ledgerTo) : undefined,
+      cursor: cursor || undefined,
+      limit: 25,
+    });
 
-  // No events at all
-  if (events.length === 0 && !cursor) {
-    errorState = getErrorState(ErrorType.NO_DATA, { address });
-  }
-  // Empty result with filters
-  else if (events.length === 0 && (topic0Filter || ledgerFrom || ledgerTo)) {
-    errorState = getErrorState(ErrorType.EMPTY_RESULT, {
-      filter: topic0Filter || `ledgers ${ledgerFrom}-${ledgerTo}`,
-      clearUrl: `/contract/${address}?network=${network}`,
+    events = result.events;
+    hasMore = result.has_more;
+    nextCursor = result.next_cursor;
+
+    // No events at all: distinguish "no events yet" (quiet, but being watched
+    // live) from "not indexed yet" (emitting on-chain, Trident hasn't caught
+    // up) via a best-effort Soroban RPC probe. Only probe unbrowsed contracts.
+    if (events.length === 0 && !cursor && !filtered) {
+      const probe = await probeContractOnChain(network, address);
+      if (probe.status === 'has_events') {
+        errorState = getErrorState(ErrorType.INDEXER_BEHIND, {
+          address,
+          currentLedger: 'checking',
+          lastIndexedLedger: 'unknown',
+        });
+      } else {
+        errorState = {
+          type: ErrorType.NO_DATA,
+          title: 'No events yet',
+          message:
+            'Trident has not recorded any events for this contract yet. If it was just deployed, its events will appear here as soon as it emits one — this page is also streaming live, so nothing will be missed.',
+          actionText: 'Back to search',
+          actionUrl: '/',
+          retryable: true,
+        };
+      }
+    }
+    // Empty result with filters
+    else if (events.length === 0 && (topic0Filter || ledgerFrom || ledgerTo)) {
+      errorState = getErrorState(ErrorType.EMPTY_RESULT, {
+        filter: topic0Filter || `ledgers ${ledgerFrom}-${ledgerTo}`,
+        clearUrl: `/contract/${address}?network=${network}`,
+      });
+    }
+  } catch (err) {
+    const error = err instanceof Error ? err : new Error(String(err));
+    let errorType = ErrorType.API_ERROR;
+    const status = error.message.match(/API (\d+)/)?.[1];
+    if (status === '404') errorType = ErrorType.NOT_FOUND;
+    else if (status === '429') errorType = ErrorType.RATE_LIMITED;
+    else if (error.name === 'AbortError') errorType = ErrorType.TIMEOUT;
+    errorState = getErrorState(errorType, {
+      error,
+      statusCode: status,
+      timeout: 30,
+      address,
     });
   }
 } catch (err) {
@@ -136,7 +182,7 @@ function filterUrl(overrides: Record<string, string>): string {
           href={`${expertBase}/contract/${address}`}
           target="_blank"
           rel="noopener noreferrer"
-          class="hover:text-white underline underline-offset-2"
+          class="hover:text-white underline underline-offset-2 focus:outline-none focus:ring-2 focus:ring-indigo-500 rounded"
         >
           Stellar Expert ↗
         </a>
@@ -160,6 +206,14 @@ function filterUrl(overrides: Record<string, string>): string {
       Copy address
     </button>
   </div>
+
+  <!-- Live stream status -->
+  {isValidContractId(address) && !filtered && (
+    <div class="mb-5 flex items-center justify-between gap-3 flex-wrap">
+      <span id="stream-status" data-status="connecting" class="inline-flex items-center gap-2" aria-live="polite"></span>
+      <span id="stream-notice" aria-live="polite"></span>
+    </div>
+  )}
 
   <!-- Error state -->
   {errorState && !events.length && (
@@ -318,88 +372,5 @@ function filterUrl(overrides: Record<string, string>): string {
 </Base>
 
 <script>
-  // Row click → navigate to event detail
-  document.querySelectorAll<HTMLTableRowElement>('tr[data-href]').forEach((row) => {
-    row.addEventListener('click', (e) => {
-      const target = e.target as HTMLElement;
-      if (target.closest('a') || target.closest('button')) return;
-      window.location.href = row.dataset.href!;
-    });
-  });
-
-  // Copy address button
-  const copyBtn = document.getElementById('copy-address') as HTMLButtonElement | null;
-  if (copyBtn) {
-    copyBtn.addEventListener('click', async () => {
-      const addr = copyBtn.dataset.address ?? '';
-      try {
-        await navigator.clipboard.writeText(addr);
-        const orig = copyBtn.textContent;
-        copyBtn.textContent = 'Copied!';
-        setTimeout(() => { copyBtn.textContent = orig; }, 1500);
-      } catch { /* clipboard unavailable */ }
-    });
-  }
-
-  // JS "Load more" — appends rows instead of navigating
-  const loadMoreLink = document.getElementById('load-more-link') as HTMLAnchorElement | null;
-  if (loadMoreLink) {
-    loadMoreLink.addEventListener('click', async (e) => {
-      e.preventDefault();
-      loadMoreLink.textContent = 'Loading…';
-      loadMoreLink.setAttribute('disabled', '');
-
-      const params = new URLSearchParams(window.location.search);
-      const network = params.get('network') ?? 'testnet';
-      const contractId = window.location.pathname.split('/')[2];
-      const apiParams = new URLSearchParams({ network, contractId });
-      if (params.get('topic0')) apiParams.set('topic0', params.get('topic0')!);
-      if (params.get('ledgerFrom')) apiParams.set('ledgerFrom', params.get('ledgerFrom')!);
-      if (params.get('ledgerTo')) apiParams.set('ledgerTo', params.get('ledgerTo')!);
-      apiParams.set('cursor', loadMoreLink.dataset.cursor!);
-
-      try {
-        const res = await fetch(`/api/events.json?${apiParams}`);
-        if (!res.ok) throw new Error('fetch failed');
-        const data: { events: any[]; has_more: boolean; next_cursor: string | null } = await res.json();
-
-        const tbody = document.getElementById('events-tbody');
-        if (tbody && data.events.length) {
-          for (const ev of data.events) {
-            const tr = document.createElement('tr');
-            tr.className = 'hover:bg-gray-900/60 cursor-pointer transition-colors';
-            tr.dataset.href = `/contract/${ev.contract_id}/event/${ev.id}?network=${network}`;
-            tr.innerHTML = `
-              <td class="px-4 py-3 text-gray-400 whitespace-nowrap text-xs">${new Date(ev.ledger_timestamp).toLocaleTimeString()}</td>
-              <td class="px-4 py-3 font-mono text-gray-300 text-xs">${ev.ledger_sequence}</td>
-              <td class="px-4 py-3"><span class="px-2 py-0.5 rounded-full text-xs bg-indigo-900/50 text-indigo-300 font-medium">${ev.topics?.[0] ?? ev.event_type}</span></td>
-              <td class="px-4 py-3 font-mono text-gray-400 text-xs truncate max-w-[180px] hidden md:table-cell">${ev.topics?.[1] ? ev.topics[1].slice(0, 20) + '...' : '—'}</td>
-              <td class="px-4 py-3 hidden lg:table-cell"><a href="${network === 'mainnet' ? 'https://stellar.expert/explorer/public' : 'https://stellar.expert/explorer/testnet'}/tx/${ev.transaction_hash}" target="_blank" rel="noopener noreferrer" class="font-mono text-xs text-gray-400 hover:text-indigo-300">${ev.transaction_hash.slice(0, 8)}...${ev.transaction_hash.slice(-6)}</a></td>
-              <td class="px-4 py-3 hidden xl:table-cell font-mono text-xs text-gray-500 max-w-[200px] truncate">${ev.data ? ev.data.slice(0, 60) : '—'}</td>
-            `;
-            tr.addEventListener('click', (e) => {
-              if ((e.target as HTMLElement).closest('a')) return;
-              window.location.href = tr.dataset.href!;
-            });
-            tbody.appendChild(tr);
-          }
-        }
-
-        if (data.has_more && data.next_cursor) {
-          loadMoreLink.dataset.cursor = data.next_cursor;
-          loadMoreLink.textContent = 'Load more';
-          loadMoreLink.removeAttribute('disabled');
-          // Update no-JS href too
-          const url = new URL(window.location.href);
-          url.searchParams.set('cursor', data.next_cursor);
-          loadMoreLink.href = url.pathname + url.search;
-        } else {
-          loadMoreLink.remove();
-        }
-      } catch {
-        loadMoreLink.textContent = 'Load more';
-        loadMoreLink.removeAttribute('disabled');
-      }
-    });
-  }
+  import '../../../lib/contract-sse';
 </script>

@@ -1,6 +1,6 @@
 -- Trident PostgreSQL Schema
 -- Convenience full-schema snapshot for local/dev bootstrap and documentation.
--- The migration chain in ./migrations/ (0001-0028) is the source of truth and is
+-- The migration chain in ./migrations/ (0001-0029) is the source of truth and is
 -- what CI and production apply; this file must mirror the end state of that chain.
 -- Keep in sync whenever a migration is added.
 
@@ -152,8 +152,28 @@ CREATE TABLE IF NOT EXISTS audit_log (
     ts           TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX IF NOT EXISTS idx_audit_log_key_ts ON audit_log (api_key_id, ts DESC);
-CREATE INDEX IF NOT EXISTS idx_audit_log_ts     ON audit_log (ts DESC);
+-- Covers the admin analytics queries (migration 0029). The INCLUDE columns
+-- are read but never seeked on, so they live only in the leaves and make
+-- those queries index-only rather than paying a heap visit per matching row.
+-- Supersedes the original idx_audit_log_key_ts (api_key_id, ts DESC), which
+-- was a strict prefix of this index.
+CREATE INDEX IF NOT EXISTS idx_audit_log_key_ts_covering
+    ON audit_log (api_key_id, ts DESC)
+    INCLUDE (status_code, endpoint, duration_ms);
+
+-- Covers the usage rollup job (migration 0029). Partial on the job's own
+-- WHERE clause: rows whose key was deleted (api_key_id is ON DELETE SET
+-- NULL) can never contribute to a per-key rollup.
+CREATE INDEX IF NOT EXISTS idx_audit_log_rollup
+    ON audit_log (ts)
+    INCLUDE (api_key_id, status_code, duration_ms)
+    WHERE api_key_id IS NOT NULL;
+
+-- Time-range scans over all rows, including those with a NULL api_key_id
+-- that idx_audit_log_rollup excludes. Also what the retention cleanup falls
+-- back to once its predicate becomes selective enough to prefer an index —
+-- see docs/db/explain-audit-log-247.txt.
+CREATE INDEX IF NOT EXISTS idx_audit_log_ts ON audit_log (ts DESC);
 
 -- ---------------------------------------------------------------------------
 -- parse_errors
@@ -538,3 +558,72 @@ CREATE TABLE IF NOT EXISTS failed_events (
 
 CREATE INDEX IF NOT EXISTS idx_failed_events_occurred_at ON failed_events (occurred_at DESC);
 CREATE INDEX IF NOT EXISTS idx_failed_events_pending ON failed_events (occurred_at) WHERE replayed_at IS NULL;
+-- Pending rows are unique per event (migration 0030): redelivered failures
+-- update in place, so COUNT(*) of pending rows = distinct poisoned events.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_failed_events_pending
+    ON failed_events (contract_id, ledger_sequence, event_index)
+    WHERE replayed_at IS NULL;
+
+
+-- ---------------------------------------------------------------------------
+-- Network value constraints  (migration 0031, issue #252)
+-- A typo such as 'testnett' silently splits the dataset in two: every query
+-- filtered on network misses those rows, and nothing errors. These CHECKs turn
+-- that into a write-time failure. Values match what the code writes -- see
+-- crates/common/src/types.rs Network.
+-- ---------------------------------------------------------------------------
+ALTER TABLE soroban_events
+    ADD CONSTRAINT chk_soroban_events_network
+    CHECK (network IN ('mainnet', 'testnet', 'futurenet', 'sandbox'));
+
+ALTER TABLE indexed_contracts
+    ADD CONSTRAINT chk_indexed_contracts_network
+    CHECK (network IS NULL OR network IN ('mainnet', 'testnet', 'futurenet', 'sandbox'));
+
+ALTER TABLE api_keys
+    ADD CONSTRAINT chk_api_keys_network
+    CHECK (network IN ('mainnet', 'testnet', 'futurenet', 'sandbox'));
+
+ALTER TABLE audit_log
+    ADD CONSTRAINT chk_audit_log_network
+    CHECK (network IS NULL OR network IN ('mainnet', 'testnet', 'futurenet', 'sandbox'));
+
+ALTER TABLE webhook_subscriptions
+    ADD CONSTRAINT chk_webhook_subscriptions_network
+    CHECK (network IN ('mainnet', 'testnet', 'futurenet', 'sandbox'));
+
+ALTER TABLE token_events
+    ADD CONSTRAINT chk_token_events_network
+    CHECK (network IN ('mainnet', 'testnet', 'futurenet', 'sandbox'));
+
+ALTER TABLE contract_invocation_metrics
+    ADD CONSTRAINT chk_contract_invocation_metrics_network
+    CHECK (network IN ('mainnet', 'testnet', 'futurenet', 'sandbox'));
+
+ALTER TABLE contract_liveness
+    ADD CONSTRAINT chk_contract_liveness_network
+    CHECK (network IN ('mainnet', 'testnet', 'futurenet', 'sandbox'));
+
+ALTER TABLE contract_verification
+    ADD CONSTRAINT chk_contract_verification_network
+    CHECK (network IN ('mainnet', 'testnet', 'futurenet', 'sandbox'));
+
+ALTER TABLE contract_specs
+    ADD CONSTRAINT chk_contract_specs_network
+    CHECK (network IN ('mainnet', 'testnet', 'futurenet', 'sandbox'));
+
+ALTER TABLE contract_stats_rollup
+    ADD CONSTRAINT chk_contract_stats_rollup_network
+    CHECK (network IN ('mainnet', 'testnet', 'futurenet', 'sandbox'));
+
+ALTER TABLE contract_event_schemas
+    ADD CONSTRAINT chk_contract_event_schemas_network
+    CHECK (network IN ('mainnet', 'testnet', 'futurenet', 'sandbox'));
+
+ALTER TABLE token_metadata
+    ADD CONSTRAINT chk_token_metadata_network
+    CHECK (network IN ('mainnet', 'testnet', 'futurenet', 'sandbox'));
+
+ALTER TABLE contract_storage_snapshots
+    ADD CONSTRAINT chk_contract_storage_snapshots_network
+    CHECK (network IN ('mainnet', 'testnet', 'futurenet', 'sandbox'));

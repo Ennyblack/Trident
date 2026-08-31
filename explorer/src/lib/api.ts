@@ -1,26 +1,3 @@
-// Issue #520: use a published SDK the way a real user would, not internal
-// APIs. This module now goes through @trident-indexer/sdk's TridentClient
-// (real retry/backoff, Zod response validation, typed errors, and a
-// per-attempt timeout) instead of a hand-rolled fetchWithTimeout — the
-// timeout the wrapper used to enforce now lives in the SDK itself, so every
-// SDK consumer gets it rather than just this app. The SDK is not published to npm yet, so
-// package.json references it via a local `file:` dependency
-// (file:../sdk/typescript) until it is; swap that for a real version range
-// once #517/#429 land a published release.
-//
-// The SDK's own types are camelCase (contractId, ledgerSequence, ...) to
-// match its own conventions, while every .astro page in this app was
-// written against the raw REST API's snake_case JSON shape (contract_id,
-// ledger_sequence, ...). Translating at this one boundary — rather than
-// migrating every field access across index.astro, contract/[address]/
-// index.astro, and contract/[address]/event/[id].astro (including inline
-// client-side <script> blocks that re-fetch this same shape from
-// /api/events.json) — gets the real behavioral benefit (actual retry
-// logic, actual response validation) without a large, higher-risk
-// find-and-rename across presentation code this session can't visually
-// verify rendered correctly.
-
-import { TridentClient, type SorobanEvent as SdkSorobanEvent } from "@trident-indexer/sdk";
 import type { SorobanEvent, ListEventsResponse, Network } from "./types";
 
 const TESTNET_URL =
@@ -28,48 +5,35 @@ const TESTNET_URL =
 const MAINNET_URL =
   import.meta.env.TRIDENT_MAINNET_API_URL ?? "https://api.mainnet.trident.dev";
 const API_KEY: string = import.meta.env.EXPLORER_API_KEY ?? "";
+const API_TIMEOUT = 30000; // 30 second timeout
 
-/**
- * Per-request timeout handed to the SDK. Pages render this figure in their
- * timeout error state, so it is exported rather than duplicated as a literal —
- * the previous hand-rolled client hardcoded 30s in both places and the two
- * drifted apart the moment the fetch wrapper was replaced.
- */
-export const TRIDENT_TIMEOUT_MS = 30_000;
-
-function apiUrlFor(network: Network): string {
+function baseUrl(network: Network): string {
   return network === "mainnet" ? MAINNET_URL : TESTNET_URL;
 }
 
-const clientCache = new Map<Network, TridentClient>();
-
-function clientFor(network: Network): TridentClient {
-  const cached = clientCache.get(network);
-  if (cached) return cached;
-
-  const client = new TridentClient({
-    apiUrl: apiUrlFor(network),
-    apiKey: API_KEY || undefined,
-    network,
-    timeoutMs: TRIDENT_TIMEOUT_MS,
-  });
-  clientCache.set(network, client);
-  return client;
+function authHeaders(): HeadersInit {
+  const h: Record<string, string> = {};
+  if (API_KEY) h["X-API-Key"] = API_KEY;
+  return h;
 }
 
-function toSnakeCaseEvent(event: SdkSorobanEvent): SorobanEvent {
-  return {
-    id: event.id,
-    contract_id: event.contractId,
-    ledger_sequence: event.ledgerSequence,
-    ledger_timestamp: event.ledgerTimestamp,
-    transaction_hash: event.transactionHash,
-    event_index: event.eventIndex,
-    event_type: event.eventType,
-    topics: event.topics,
-    data: typeof event.data === "string" ? event.data : JSON.stringify(event.data),
-    created_at: event.createdAt,
-  };
+/**
+ * Typed error for a non-OK Trident API response. `code` is the machine
+ * readable code from the standard {"error":{code,message}} envelope so callers
+ * can surface a deliberate state instead of a raw error string.
+ */
+export class ApiError extends Error {
+  readonly status: number;
+  readonly code: string;
+  readonly requestId?: string;
+
+  constructor(status: number, code: string, message: string, requestId?: string) {
+    super(message || `Request failed (HTTP ${status})`);
+    this.name = "ApiError";
+    this.status = status;
+    this.code = code;
+    this.requestId = requestId;
+  }
 }
 
 export interface QueryEventsParams {
@@ -82,33 +46,103 @@ export interface QueryEventsParams {
   network?: Network;
 }
 
+async function fetchWithTimeout(
+  url: string,
+  options: RequestInit = {},
+  timeoutMs = API_TIMEOUT,
+): Promise<Response> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const res = await fetch(url, {
+      ...options,
+      signal: controller.signal,
+    });
+    return res;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+/**
+ * Fetch a JSON body and throw an {@link ApiError} on any non-OK response or
+ * network failure. The error carries an HTTP status and a machine code so the
+ * caller can render a deliberate, honest state rather than a raw string.
+ */
+async function fetchJson<T>(url: string, init?: RequestInit): Promise<T> {
+  let res: Response;
+  try {
+    res = await fetchWithTimeout(url, init);
+  } catch {
+    throw new ApiError(0, "NETWORK", "Could not reach the indexer");
+  }
+  if (!res.ok) {
+    let code = "";
+    let message = "";
+    let requestId: string | undefined;
+    try {
+      const body = (await res.json()) as {
+        error?: { code?: string; message?: string; request_id?: string };
+      };
+      code = body?.error?.code ?? "";
+      message = body?.error?.message ?? "";
+      requestId = body?.error?.request_id;
+    } catch {
+      // Non-JSON error body — fall through with generic values.
+    }
+    throw new ApiError(res.status, code || `HTTP_${res.status}`, message, requestId);
+  }
+  return (await res.json()) as T;
+}
+
 export async function listEvents(
   params: QueryEventsParams = {},
 ): Promise<ListEventsResponse> {
   const network: Network = params.network ?? "testnet";
-  const client = clientFor(network);
+  const url = new URL(`${baseUrl(network)}/v1/events`);
+  if (params.contractId) url.searchParams.set("contractId", params.contractId);
+  if (params.topic0) url.searchParams.set("topic0", params.topic0);
+  if (params.ledgerFrom != null)
+    url.searchParams.set("ledgerFrom", String(params.ledgerFrom));
+  if (params.ledgerTo != null)
+    url.searchParams.set("ledgerTo", String(params.ledgerTo));
+  if (params.cursor) url.searchParams.set("cursor", params.cursor);
+  url.searchParams.set("limit", String(params.limit ?? 25));
 
-  const result = await client.queryEvents({
-    contractId: params.contractId,
-    topic0: params.topic0,
-    ledgerFrom: params.ledgerFrom,
-    ledgerTo: params.ledgerTo,
-    after: params.cursor,
-    limit: params.limit ?? 25,
-  });
-
-  return {
-    events: result.events.map(toSnakeCaseEvent),
-    has_more: result.hasMore,
-    next_cursor: result.cursor,
-  };
+  return fetchJson<ListEventsResponse>(url.toString(), { headers: authHeaders() });
 }
 
 export async function getEvent(
   id: string,
   network: Network = "testnet",
 ): Promise<SorobanEvent> {
-  const client = clientFor(network);
-  const event = await client.getEventById({ id });
-  return toSnakeCaseEvent(event);
+  const body = await fetchJson<{ event: SorobanEvent }>(
+    `${baseUrl(network)}/v1/events/${encodeURIComponent(id)}`,
+    { headers: authHeaders() },
+  );
+  return body.event;
+}
+
+/**
+ * Build the Trident SSE stream URL for a contract. This is fetched by the
+ * explorer's own /api/events/stream proxy (never directly from the browser),
+ * so the API key and the Last-Event-ID handshake stay server-side.
+ */
+export function streamUrl(network: Network, contractId: string, topic0 = ""): string {
+  const url = new URL(`${baseUrl(network)}/v1/events/stream`);
+  url.searchParams.set("contractId", contractId);
+  if (topic0) url.searchParams.set("topic0", topic0);
+  return url.toString();
+}
+
+/** Base headers for streaming requests (server-side only). */
+export function streamHeaders(lastEventId?: string): HeadersInit {
+  const h: Record<string, string> = {
+    Accept: "text/event-stream",
+    "Cache-Control": "no-cache",
+  };
+  if (API_KEY) h["X-API-Key"] = API_KEY;
+  if (lastEventId) h["Last-Event-ID"] = lastEventId;
+  return h;
 }

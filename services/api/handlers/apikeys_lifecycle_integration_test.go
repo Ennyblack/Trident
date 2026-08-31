@@ -30,7 +30,7 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-const testAdminKey = "test-admin-key-for-lifecycle-integration"
+const testLifecycleAdminKey = "test-admin-key-for-lifecycle-integration"
 
 func sha256Hex(s string) string {
 	h := sha256.Sum256([]byte(s))
@@ -69,7 +69,7 @@ func connectRealTestRedis(t *testing.T) *redis.Client {
 func createKeyViaHandler(t *testing.T, cfg handlers.APIKeyConfig, body string) handlers.APIKeyResponse {
 	t.Helper()
 	req := httptest.NewRequest(http.MethodPost, "/v1/api-keys", strings.NewReader(body))
-	req.Header.Set("X-Admin-Key", testAdminKey)
+	req.Header.Set("X-Admin-Key", testLifecycleAdminKey)
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 
@@ -108,7 +108,7 @@ func TestAPIKeyLifecycle_IssueAuthenticateRevokeIsImmediate(t *testing.T) {
 	rdb := connectRealTestRedis(t)
 	ctx := context.Background()
 
-	cfg := handlers.APIKeyConfig{AdminKey: testAdminKey, DB: pool, Redis: rdb}
+	cfg := handlers.APIKeyConfig{AdminKey: testLifecycleAdminKey, DB: pool, Redis: rdb}
 	authCfg := middleware.DBAuthConfig{DB: pool, Redis: rdb}
 
 	created := createKeyViaHandler(t, cfg,
@@ -137,7 +137,7 @@ func TestAPIKeyLifecycle_IssueAuthenticateRevokeIsImmediate(t *testing.T) {
 	// 3. Revoke the key via the same DeleteAPIKey handler an admin would use.
 	req := httptest.NewRequest(http.MethodDelete, "/v1/api-keys/"+created.ID, nil)
 	req.SetPathValue("id", created.ID)
-	req.Header.Set("X-Admin-Key", testAdminKey)
+	req.Header.Set("X-Admin-Key", testLifecycleAdminKey)
 	rec := httptest.NewRecorder()
 	handlers.DeleteAPIKey(cfg).ServeHTTP(rec, req)
 	if rec.Code != http.StatusNoContent {
@@ -179,7 +179,7 @@ func TestAPIKeyLifecycle_RotationOverlapWindow(t *testing.T) {
 	pool := connectRealTestDB(t)
 	rdb := connectRealTestRedis(t)
 
-	cfg := handlers.APIKeyConfig{AdminKey: testAdminKey, DB: pool, Redis: rdb}
+	cfg := handlers.APIKeyConfig{AdminKey: testLifecycleAdminKey, DB: pool, Redis: rdb}
 	authCfg := middleware.DBAuthConfig{DB: pool, Redis: rdb}
 
 	oldKey := createKeyViaHandler(t, cfg,
@@ -206,7 +206,7 @@ func TestAPIKeyLifecycle_RotationOverlapWindow(t *testing.T) {
 	// End the overlap window: revoke only the old key.
 	req := httptest.NewRequest(http.MethodDelete, "/v1/api-keys/"+oldKey.ID, nil)
 	req.SetPathValue("id", oldKey.ID)
-	req.Header.Set("X-Admin-Key", testAdminKey)
+	req.Header.Set("X-Admin-Key", testLifecycleAdminKey)
 	rec := httptest.NewRecorder()
 	handlers.DeleteAPIKey(cfg).ServeHTTP(rec, req)
 	if rec.Code != http.StatusNoContent {
@@ -235,7 +235,7 @@ func TestAPIKeyLifecycle_AuditTrailRecordsUsage(t *testing.T) {
 	pool := connectRealTestDB(t)
 	ctx := context.Background()
 
-	cfg := handlers.APIKeyConfig{AdminKey: testAdminKey, DB: pool}
+	cfg := handlers.APIKeyConfig{AdminKey: testLifecycleAdminKey, DB: pool}
 	created := createKeyViaHandler(t, cfg, `{"label":"audit-test","network":"testnet"}`)
 	t.Cleanup(func() {
 		_, _ = pool.Exec(context.Background(), `DELETE FROM audit_log WHERE api_key_id = $1`, created.ID)
