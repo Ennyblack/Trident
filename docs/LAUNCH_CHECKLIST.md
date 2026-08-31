@@ -10,7 +10,7 @@ config, is what turns this from a template into a completed launch gate.
 | # | Gate | Pass/Fail | Evidence | Signed off by |
 |---|------|-----------|----------|----------------|
 | 1 | Alerts verified firing (trigger each alert deliberately, confirm on-call receives it) | | | |
-| 2 | Backup restore performed end-to-end (see `scripts/backup.sh`/`restore.sh` if present, or the DB's documented procedure) | | | |
+| 2 | Backup restore performed end-to-end — see [`scripts/backup.sh`](../scripts/backup.sh), [`scripts/restore.sh`](../scripts/restore.sh), and [`docs/runbooks/postgres-backup-restore.md`](./runbooks/postgres-backup-restore.md) | | | |
 | 3 | Soak test passed (sustained load for the documented duration with no leaks/degradation) | | | |
 | 4 | Chaos test passed (kill a pod/dependency mid-traffic, confirm recovery) | | | |
 | 5 | Core user journey test green against production configuration | | | |
