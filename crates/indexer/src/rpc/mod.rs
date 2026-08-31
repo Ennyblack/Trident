@@ -144,12 +144,10 @@ struct GetLedgersResult {
 /// `getLatestLedger` takes no parameters, but the JSON-RPC envelope this client
 /// builds always serialises a `params` member.
 ///
-/// Test-gated alongside [`RpcClient::get_latest_ledger`], its only caller.
-#[cfg(test)]
+/// Used by [`RpcClient::get_latest_ledger`].
 #[derive(Serialize)]
 struct EmptyParams {}
 
-#[cfg(test)]
 #[derive(Deserialize)]
 struct GetLatestLedgerResult {
     sequence: u64,
@@ -520,8 +518,8 @@ impl RpcClient {
     /// it already makes, so the running indexer has no reason to spend an extra
     /// round trip on it. Only the testnet correctness suite (issue #419), which
     /// must choose a ledger window before it can request anything, needs it.
-    /// Remove the gate if a production caller ever appears.
-    #[cfg(test)]
+    /// Un-gated: the reorg detector (issue #196) is a production caller that
+    /// must learn the tip before it can bound a rollback window.
     pub async fn get_latest_ledger(&self) -> Result<u64, TridentError> {
         let result: GetLatestLedgerResult = self
             .call("getLatestLedger", 3, EmptyParams {}, "getLatestLedger")
