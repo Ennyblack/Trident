@@ -153,6 +153,13 @@ func routeBindings() []routeBinding {
 			return middleware.ResponseCache(d.redisClient, contractMetadataCacheTTL,
 				middleware.DefaultCacheKey)(handlers.ContractSpec(d.schemaRegistryDB))
 		}),
+		// SEP-41 token metadata resolved by the indexer (issue #263). Its
+		// registration was dropped when routes moved out of main.go, leaving
+		// the handler unreachable and TokenMetadataResponse unused in the spec.
+		documented("GET", "/v1/contracts/{id}/metadata", func(d routeDeps) http.Handler {
+			return middleware.ResponseCache(d.redisClient, contractMetadataCacheTTL,
+				middleware.DefaultCacheKey)(handlers.TokenMetadata(d.pool))
+		}),
 		documented("GET", "/v1/contracts/{id}/storage", func(d routeDeps) http.Handler {
 			return handlers.ContractStorageLatest(d.schemaRegistryDB)
 		}),
