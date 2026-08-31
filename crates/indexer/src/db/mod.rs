@@ -764,42 +764,58 @@ pub async fn handle_reorg_rollback(
         .bind(seq_i64)
         .execute(&mut *tx)
         .await
-        .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("reorg delete token_events")))?;
+        .map_err(|e| {
+            TridentError::storage(anyhow::Error::new(e).context("reorg delete token_events"))
+        })?;
 
     // Delete invocation metrics
     sqlx::query("DELETE FROM contract_invocation_metrics WHERE ledger_sequence >= $1")
         .bind(seq_i64)
         .execute(&mut *tx)
         .await
-        .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("reorg delete contract_invocation_metrics")))?;
+        .map_err(|e| {
+            TridentError::storage(
+                anyhow::Error::new(e).context("reorg delete contract_invocation_metrics"),
+            )
+        })?;
 
     // Delete storage snapshots
     sqlx::query("DELETE FROM contract_storage_snapshots WHERE ledger_sequence >= $1")
         .bind(seq_i64)
         .execute(&mut *tx)
         .await
-        .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("reorg delete contract_storage_snapshots")))?;
+        .map_err(|e| {
+            TridentError::storage(
+                anyhow::Error::new(e).context("reorg delete contract_storage_snapshots"),
+            )
+        })?;
 
     // Delete primary soroban events
     sqlx::query("DELETE FROM soroban_events WHERE ledger_sequence >= $1")
         .bind(seq_i64)
         .execute(&mut *tx)
         .await
-        .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("reorg delete soroban_events")))?;
+        .map_err(|e| {
+            TridentError::storage(anyhow::Error::new(e).context("reorg delete soroban_events"))
+        })?;
 
     // Delete ledger metadata
     sqlx::query("DELETE FROM ledger_metadata WHERE ledger_sequence >= $1")
         .bind(seq_i64)
         .execute(&mut *tx)
         .await
-        .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("reorg delete ledger_metadata")))?;
+        .map_err(|e| {
+            TridentError::storage(anyhow::Error::new(e).context("reorg delete ledger_metadata"))
+        })?;
 
     // Rewind cursor in system_state
-    sqlx::query("UPDATE system_state SET value = $1, updated_at = NOW() WHERE key = 'latest_ledger_cursor'")
-        .bind(new_cursor.to_string())
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("reorg rewind cursor")))?;
+    sqlx::query(
+        "UPDATE system_state SET value = $1, updated_at = NOW() WHERE key = 'latest_ledger_cursor'",
+    )
+    .bind(new_cursor.to_string())
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("reorg rewind cursor")))?;
 
     tx.commit()
         .await

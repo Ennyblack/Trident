@@ -212,68 +212,6 @@ fn parse_event_type(raw: &str) -> Result<EventType, TridentError> {
         ))),
     }
 }
-
-/// Render a 256-bit unsigned value, supplied as four 64-bit limbs
-/// (most-significant first), as a decimal string.
-///
-/// Rust has no u256, and the previous implementation packed all four limbs
-/// into a u128 with 32-bit shifts — which both truncated the top half and
-/// mis-positioned the rest, so any value above 2^128 decoded to a
-/// plausible-looking but wrong number. Long multiplication over decimal
-/// digits avoids needing a big-integer dependency for the one place we need
-/// this (issue #415).
-fn u256_limbs_to_decimal(limbs: [u64; 4]) -> String {
-    // digits holds the running value, least-significant decimal digit first.
-    let mut digits: Vec<u8> = vec![0];
-    for limb in limbs {
-        // value = value * 2^64 + limb, done as two steps over base-10 digits.
-        for _ in 0..64 {
-            let mut carry = 0u8;
-            for d in digits.iter_mut() {
-                let doubled = *d * 2 + carry;
-                *d = doubled % 10;
-                carry = doubled / 10;
-            }
-            if carry > 0 {
-                digits.push(carry);
-            }
-        }
-        let mut carry = limb as u128;
-        let mut i = 0;
-        while carry > 0 || i < digits.len() {
-            if i == digits.len() {
-                digits.push(0);
-            }
-            let sum = digits[i] as u128 + (carry % 10);
-            digits[i] = (sum % 10) as u8;
-            carry = carry / 10 + sum / 10;
-            i += 1;
-        }
-    }
-    while digits.len() > 1 && *digits.last().unwrap() == 0 {
-        digits.pop();
-    }
-    digits.iter().rev().map(|d| (b'0' + d) as char).collect()
-}
-
-/// Render a 256-bit signed value from its limbs. `hi_hi` is the signed
-/// most-significant limb; negatives are two's complement across all 256 bits,
-/// so they are negated into the unsigned domain and printed with a sign.
-fn i256_limbs_to_decimal(hi_hi: i64, hi_lo: u64, lo_hi: u64, lo_lo: u64) -> String {
-    if hi_hi >= 0 {
-        return u256_limbs_to_decimal([hi_hi as u64, hi_lo, lo_hi, lo_lo]);
-    }
-    // Two's complement negate: invert all limbs, then add one with carry.
-    let mut limbs = [!(hi_hi as u64), !hi_lo, !lo_hi, !lo_lo];
-    for limb in limbs.iter_mut().rev() {
-        let (next, overflow) = limb.overflowing_add(1);
-        *limb = next;
-        if !overflow {
-            break;
-        }
-    }
-    format!("-{}", u256_limbs_to_decimal(limbs))
-}
 #[cfg(test)]
 mod tests {
     use super::*;

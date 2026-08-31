@@ -1579,6 +1579,7 @@ mod tests {
             db_pool_size: 3,
             redis_url: redis_url.to_string(),
             network: "testnet".to_string(),
+            max_reorg_depth: 128,
             poll_interval: Duration::from_millis(50),
             poll_interval_floor: Duration::from_millis(50),
             poll_interval_ceiling: Duration::from_millis(500),
@@ -2825,7 +2826,9 @@ mod tests {
         // Mock RPC latest ledger as 100 (indicating rollback of 101 & 102)
         Mock::given(method("POST"))
             .and(path("/"))
-            .and(body_partial_json(serde_json::json!({ "method": "getLatestLedger" })))
+            .and(body_partial_json(
+                serde_json::json!({ "method": "getLatestLedger" }),
+            ))
             .respond_with(rpc_ok(serde_json::json!({
                 "jsonrpc": "2.0",
                 "id": 1,
@@ -2837,7 +2840,9 @@ mod tests {
         // Mock getLedgers
         Mock::given(method("POST"))
             .and(path("/"))
-            .and(body_partial_json(serde_json::json!({ "method": "getLedgers" })))
+            .and(body_partial_json(
+                serde_json::json!({ "method": "getLedgers" }),
+            ))
             .respond_with(rpc_ok(serde_json::json!({
                 "jsonrpc": "2.0",
                 "id": 1,
@@ -2849,7 +2854,9 @@ mod tests {
         // Mock getEvents returning empty to complete poll
         Mock::given(method("POST"))
             .and(path("/"))
-            .and(body_partial_json(serde_json::json!({ "method": "getEvents" })))
+            .and(body_partial_json(
+                serde_json::json!({ "method": "getEvents" }),
+            ))
             .respond_with(rpc_ok(events_page(100, 0)))
             .mount(&server)
             .await;
@@ -2863,17 +2870,25 @@ mod tests {
         assert_eq!(cursor, 100, "cursor should be rewound to reorg tip 100");
 
         // Verify old stale events and metadata from 101 & 102 are deleted
-        let count_events: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM soroban_events WHERE ledger_sequence > 100")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert_eq!(count_events.0, 0, "stale soroban_events from reorged ledgers must be deleted");
+        let count_events: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM soroban_events WHERE ledger_sequence > 100")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            count_events.0, 0,
+            "stale soroban_events from reorged ledgers must be deleted"
+        );
 
-        let count_meta: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM ledger_metadata WHERE ledger_sequence > 100")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert_eq!(count_meta.0, 0, "stale ledger_metadata from reorged ledgers must be deleted");
+        let count_meta: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM ledger_metadata WHERE ledger_sequence > 100")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            count_meta.0, 0,
+            "stale ledger_metadata from reorged ledgers must be deleted"
+        );
 
         pool.close().await;
     }
@@ -2889,7 +2904,9 @@ mod tests {
         // Mock RPC latest ledger as 100 when cursor is 500 (depth 400 > max_reorg_depth 128)
         Mock::given(method("POST"))
             .and(path("/"))
-            .and(body_partial_json(serde_json::json!({ "method": "getLatestLedger" })))
+            .and(body_partial_json(
+                serde_json::json!({ "method": "getLatestLedger" }),
+            ))
             .respond_with(rpc_ok(serde_json::json!({
                 "jsonrpc": "2.0",
                 "id": 1,
@@ -2902,7 +2919,10 @@ mod tests {
         let mut cursor = 500u64;
 
         let result = s.poll_once(&mut cursor).await;
-        assert!(result.is_err(), "deep reorg exceeding max_reorg_depth must return Err");
+        assert!(
+            result.is_err(),
+            "deep reorg exceeding max_reorg_depth must return Err"
+        );
 
         pool.close().await;
     }
