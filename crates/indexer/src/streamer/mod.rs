@@ -2809,9 +2809,9 @@ mod tests {
 
         sqlx::query(
             r#"
-            INSERT INTO soroban_events (id, contract_id, ledger_sequence, ledger_timestamp, transaction_hash, event_index, topic_json, value_json, raw_payload)
-            VALUES ('00000000-0000-0000-0000-000000000101', 'CDEMO', 101, '2024-01-01T00:00:05Z', 'tx101', 0, '[]', '{}', 'raw'),
-                   ('00000000-0000-0000-0000-000000000102', 'CDEMO', 102, '2024-01-01T00:00:10Z', 'tx102', 0, '[]', '{}', 'raw')
+            INSERT INTO soroban_events (id, contract_id, ledger_sequence, ledger_timestamp, transaction_hash, event_index, event_type, topics, data)
+            VALUES ('00000000-0000-0000-0000-000000000101', 'CDEMO', 101, '2024-01-01T00:00:05Z', 'tx101', 0, 'contract', '[]', '{}'),
+                   ('00000000-0000-0000-0000-000000000102', 'CDEMO', 102, '2024-01-01T00:00:10Z', 'tx102', 0, 'contract', '[]', '{}')
             "#,
         )
         .execute(&pool)
