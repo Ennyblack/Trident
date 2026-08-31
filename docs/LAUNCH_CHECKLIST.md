@@ -39,6 +39,7 @@ text, and open P1/P2 incidents — both still require a human).
 | 7 | Docs quickstart walked by someone who hasn't seen the codebase, start to finish | | | |
 | 8 | On-call schedule confirmed and reachable | | | |
 | 9 | Rollback rehearsed — see `docs/ROLLBACK_RUNBOOK.md` | | | |
+| 10 | Testnet cutover runbook walked through — see `docs/runbooks/testnet-cutover.md` | | | |
 
 ## No-go criteria
 

@@ -181,6 +181,6 @@ Running these before pushing means CI passes on the first try. See [`CONTRIBUTIN
 
 🔱
 
-[Discussions](https://github.com/trident-build/trident/discussions) · [Specification](./docs/SPECIFICATION.md) · [API Stability Policy](./docs/API_STABILITY.md) · [SDK Versioning Policy](./docs/SDK_VERSIONING_POLICY.md) · [10-Min Quickstart](./docs/QUICKSTART.md)
+[Discussions](https://github.com/trident-build/trident/discussions) · [Specification](./docs/SPECIFICATION.md) · [API Stability Policy](./docs/API_STABILITY.md) · [SDK Versioning Policy](./docs/SDK_VERSIONING_POLICY.md) · [10-Min Quickstart](./docs/QUICKSTART.md) · [Cutover Runbook](./docs/runbooks/testnet-cutover.md)
 
 </div>
