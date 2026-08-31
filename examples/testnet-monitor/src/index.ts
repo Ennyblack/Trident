@@ -58,7 +58,7 @@ async function main() {
 
     // 3. Live WebSocket Subscription
     console.log("\n⚡ Subscribing to real-time events over WebSocket...");
-    const sub = client.subscribe({
+    const sub = client.subscribeToContract({
       contractId: CONTRACT_ID,
       onEvent: (event: SorobanEvent) => {
         console.log("\n🔔 [LIVE EVENT RECEIVED]");
