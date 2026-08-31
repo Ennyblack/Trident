@@ -84,6 +84,10 @@ description is accurate. Keep this file honest by hand.
 | `OUTBOX_POLL_INTERVAL_MS` | Optional | `100` (min `10`, max `60000`) | How often the relay scans for unpublished events. |
 | `OUTBOX_BATCH_SIZE` | Optional | `500` (min `1`, max `10000`) | Max events published per relay pass. |
 | `OUTBOX_BACKLOG_ALERT_THRESHOLD` | Optional | `10000` (min `1`, max `10000000`) | Backlog size that logs an alert-worthy warning. |
+| `RECONCILE_ENABLED` | Optional | `true` | Runs the ledger-range reconciliation loop that compares indexed event counts against the RPC source (#511). Disabling it means nothing verifies indexed data against the chain. |
+| `RECONCILE_INTERVAL_MS` | Optional | `600000` (min `10000`, max `86400000`) | Time between reconciliation passes. |
+| `RECONCILE_LEDGER_SPAN` | Optional | `400` (min `10`, max `100000`) | Settled ledgers each pass compares. |
+| `RECONCILE_TIP_MARGIN` | Optional | `100` (min `0`, max `10000`) | Distance behind the chain tip the window sits, so in-flight ledgers never read as discrepancies. |
 
 ### Lag alerting
 
@@ -116,6 +120,7 @@ description is accurate. Keep this file honest by hand.
 | `ADMIN_API_KEY` | Optional | empty (admin endpoints disabled) | Shared secret for `X-Admin-Key`, gating `/v1/admin/*`. |
 | `INTERNAL_API_KEY` | Required to use `/internal/status` (fails closed) | empty | Shared secret for `X-Internal-Key`, gating `GET /internal/status` (issue #316). **Unset means the endpoint rejects every request** — never treat empty as "no auth needed". Compared with `crypto/subtle.ConstantTimeCompare`. |
 | `API_KEY_HASHES` | Optional | empty | Comma-separated HMAC-SHA256 hashes of accepted API keys, salted with `API_KEY_SALT`. |
+| `API_KEY` | Optional | empty | Single accepted HMAC-SHA256 API key hash, salted with `API_KEY_SALT`. |
 | `API_KEY_SALT` | Optional but should be changed | `change-this-to-a-random-string` | Salt for API key hashing. |
 | `ALLOWED_ORIGINS` | Required in production | — (dev mode allows any origin) | Comma-separated CORS allow-list (`https://` origins, or `http://localhost*`). |
 | `REQUEST_TIMEOUT_MS` | Optional | `30000` | Per-request timeout middleware; excludes `/ws` and `/v1/events/stream`. |
@@ -123,6 +128,7 @@ description is accurate. Keep this file honest by hand.
 | `REDIS_STREAM_KEY` | Optional | `trident:events` | Redis stream key used for event pub/sub and webhook consumption; must match the indexer's stream. |
 | `WEBHOOK_CONSUMER_GROUP` | Optional | `trident-webhooks` | Redis Stream consumer-group name for the webhook delivery worker. |
 | `WEBHOOK_CONSUMER_NAME` | Optional | `webhook-worker` | Redis Stream consumer name for the webhook delivery worker. |
+| `WEBHOOK_SECRET_OVERLAP_HOURS` | Optional | `24` | Hours a rotated webhook secret stays valid after `POST /v1/webhooks/{id}/rotate-secret`. The hourly cleanup job clears `secondary_secret` once this window passes, so a rotated secret is actually revoked. Values that are non-positive or unparseable fall back to the default. |
 | `RATE_LIMIT_FREE_RPS` | Optional | `10` | Requests/sec limit, free tier. |
 | `RATE_LIMIT_PRO_RPS` | Optional | `100` | Requests/sec limit, pro/standard tier. |
 | `RATE_LIMIT_INTERNAL_RPS` | Optional | `1000` | Requests/sec limit, internal tier. |

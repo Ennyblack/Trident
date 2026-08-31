@@ -4,7 +4,15 @@ One section per alert in [`monitoring/alerts.yml`](../../monitoring/alerts.yml).
 Each section covers what the alert means, why its threshold was picked, and
 the first steps to take when it fires. See
 [`docs/metrics-catalog.md`](../metrics-catalog.md) for what every metric
-referenced here actually measures.
+referenced here actually measures. Routing (which severity/service pages
+whom) is configured in [`monitoring/alertmanager.yml`](../../monitoring/alertmanager.yml) —
+"page on-call" below means whatever's wired into that file's
+`on-call-critical`/`on-call-warning` receivers.
+
+**Related runbooks:**
+- [`incident-response.md`](incident-response.md) — severity classification (SEV-1/2/3), on-call owner, escalation path, and user communication channel.
+- [`alert-routing.md`](alert-routing.md) — Alertmanager configuration, pre-launch routing test checklist, and maintenance silences.
+- [`post-incident-review.md`](post-incident-review.md) — PIR template; complete within 72 hours of resolving any SEV-1 or SEV-2 incident.
 
 ## TridentIndexerLagWarning
 
@@ -111,6 +119,80 @@ malformed events.
    coincides with the spike.
 3. If it's a new, valid event shape, this is a parser bug — file/fix rather
    than treating it as transient.
+
+## TridentIndexerUnexpectedScValVariant
+
+**Means:** an event payload contained an ScVal variant that no well-behaved
+contract emits — `ContractInstance`, `LedgerKeyContractInstance`, or
+`LedgerKeyNonce`. The decoder (issue #506) stored the value faithfully as a
+tagged JSON object; nothing was lost or coerced, but the traffic is
+anomalous.
+
+**Why this threshold:** any occurrence at all is worth a look — these
+variants exist for ledger entries, not event payloads, so a contract putting
+them into events is at best confused and at worst probing the decoder. `> 0
+over 1h, for 5m` surfaces every occurrence without flapping on a single
+scrape.
+
+Note this alert cannot fire for *unknown* variants: the decoder matches the
+`ScVal` enum exhaustively with no fallback arm, so a variant added by an XDR
+upgrade fails compilation instead of reaching production.
+
+**First steps:**
+1. Find the warn-level `decoded an ScVal variant that should not appear in
+   event payloads` log lines — they name the variant and decode context.
+2. Identify the emitting contract from the surrounding event logs and review
+   what it publishes.
+3. If a legitimate new use appears for one of these variants in event
+   payloads, decide its first-class rendering and demote it from the
+   anomalous set.
+## TridentIndexerReconciliationMismatch
+
+**Means:** the reconciliation loop (issue #511) re-fetched a settled ledger
+window from `getEvents` - applying the ingest pipeline's own filter and skip
+rules - and the per-ledger event counts disagree with what the database
+holds (`soroban_events` plus `parse_errors`). Some ledgers are
+under-indexed (missing events) or over-indexed (extra events).
+
+**Why this threshold:** any disagreement at all means the indexed data is
+wrong for those ledgers; the gauge is refreshed every pass (default 10
+minutes), so `for: 15m` means at least two consecutive passes agreed on the
+disagreement. Warning rather than critical while the detector is new;
+ratchet to critical once it has run clean on testnet for a while.
+
+**First steps:**
+1. Find the `Reconciliation discrepancy` warn logs - they name each ledger
+   range with the RPC and database counts
+   (`trident_indexer_reconcile_missing_events_total` vs
+   `_extra_events_total` says which direction).
+2. For missing events, re-ingest the reported ranges:
+   `trident-backfill --from-ledger <from> --to-ledger <to>` (idempotent).
+   Use `--dry-run` first to preview counts for any range on demand.
+3. If the discrepancy reappears on later passes for NEW ranges, the ingest
+   pipeline is dropping events right now - check parse-error rates, RPC
+   health, and recent deploys before backfilling further.
+4. Extra events (indexed rows the chain does not report) usually mean a
+   backfill wrote rows outside the allowlist rules or a duplicate-index bug
+   - inspect the rows in the reported range before deleting anything.
+
+## TridentIndexerReconciliationFailing
+
+**Means:** the reconciliation loop keeps aborting before producing a report
+- `getLatestLedger`/`getEvents` failures, or database errors during the
+count queries.
+
+**Why this threshold:** a single failed pass self-heals next interval; more
+than two failures inside 30 minutes, sustained for 30 minutes, means the
+loop has effectively stopped verifying. While this fires, the mismatch
+alert's silence is unknown, not clean.
+
+**First steps:**
+1. Check the `Reconciliation pass failed` warn logs for the error.
+2. If RPC-related, see `TridentIndexerRPCErrorRateHigh` - the reconciler
+   shares the endpoint pool and fails alongside it.
+3. If the indexer cursor has not yet reached the settled window (fresh
+   deploy, deep backfill), passes fail with "nothing to reconcile yet" -
+   expected until the indexer catches up.
 
 ## TridentIndexerRPCErrorRateHigh
 
@@ -222,6 +304,133 @@ absorbs on its own.
 3. As a mitigation, `GO_API_DB_POOL_SIZE` can be raised without a code
    change, but treat it as a stopgap if the root cause is a query regression.
 
+
+---
+
+## TridentDiskSpaceLow
+
+**Means:** less than 15% of the Postgres data volume remains, regardless of trend.
+
+**Why this threshold:** the two predictive alerts above extrapolate a 6-hour trend, which cannot see a step change — a large backfill, a WAL pileup behind a stalled replication slot, or a runaway temp file. This is the backstop for those, so it fires on the level rather than the slope.
+
+**First steps:**
+1. Identify the consumer: `pg_ls_waldir()` for WAL,
+   `pg_stat_replication` / `pg_replication_slots` for a stalled slot, and the
+   table-size query above for ordinary growth.
+2. A stalled replication slot is the most common non-obvious cause — an
+   inactive slot pins WAL indefinitely. Drop it if the replica is genuinely
+   gone: `SELECT pg_drop_replication_slot('<name>');`
+3. If it is ordinary growth, treat it as
+   `TridentDiskFillingWithin48Hours` above.
+
+---
+
+## TridentPartitionExhaustionWarning
+
+**Means:** `trident_indexer_partition_lookahead_ledgers` — the distance in
+ledgers between the current ingest cursor and the upper bound of the last named
+`soroban_events` partition — has been below 5,000,000 for 30 minutes.
+
+**Why this threshold:** at Stellar's current rate of ~17,280 ledgers/day,
+5,000,000 ledgers is ~289 days of runway. That is intentionally generous: adding
+a partition is a single SQL call but requires operator attention, and the
+indexer will halt entirely (Fatal error, see below) if the boundary is actually
+reached. This warning fires while there is still months of time to act, not
+days.
+
+**First steps:**
+1. Confirm the current boundary — query the DB directly:
+   ```sql
+   SELECT MAX(
+       (regexp_match(
+           pg_get_partition_constraintdef(child.oid),
+           'ledger_sequence < (\d+)'
+       ))[1]::bigint
+   )
+   FROM pg_inherits
+   JOIN pg_class parent ON parent.oid = inhparent
+   JOIN pg_class child  ON child.oid  = inhrelid
+   WHERE parent.relname = 'soroban_events';
+   ```
+2. Add the next partition. Each partition covers 2,000,000 ledgers; extend
+   from the current upper bound:
+   ```sql
+   SELECT create_soroban_partition(60000000, 62000000);
+   -- then the next one:
+   SELECT create_soroban_partition(62000000, 64000000);
+   ```
+   The `create_soroban_partition` function (defined in migration
+   `0017_soroban_events_partitioning.sql`) is idempotent — calling it for
+   a range that already exists returns `'already exists: ...'` without error.
+3. Verify the metric drops back to a safe value on the next poll cycle
+   (within the indexer's configured poll interval after the partition is
+   created).
+
+**Why it fires as a warning, not a page:** there is months of runway at the
+5M threshold. Create a ticket, action it during business hours, and monitor
+the gauge. Escalate to `TridentPartitionExhausted` (critical) if the lookahead
+continues to fall without action.
+
+## TridentPartitionExhausted
+
+**Means:** `trident_indexer_partition_lookahead_ledgers` is at or below 0 —
+the ingest cursor has reached or passed the upper bound of the last named
+`soroban_events` partition. The indexer will refuse to commit any further pages
+and will halt with a `Fatal` error on the next poll cycle that produces events.
+
+**Why this threshold:** a `<= 0` lookahead means the very next INSERT would
+land in `soroban_events_default` — the unindexed, unmanaged DEFAULT catch-all
+partition. Silently writing there would make data invisible to API queries and
+unrecoverable by normal partition retention tools. The indexer halts rather
+than corrupt the event stream (see `assert_no_default_partition_overflow` in
+`crates/indexer/src/db/mod.rs`).
+
+**This is a total ingest outage.** Treat as SEV-1. Resolve before resuming.
+
+**First steps:**
+1. **Add the next partition immediately.** Get the exact boundary value:
+   ```sql
+   SELECT MAX(
+       (regexp_match(
+           pg_get_partition_constraintdef(child.oid),
+           'ledger_sequence < (\d+)'
+       ))[1]::bigint
+   ) AS last_upper
+   FROM pg_inherits
+   JOIN pg_class parent ON parent.oid = inhparent
+   JOIN pg_class child  ON child.oid  = inhrelid
+   WHERE parent.relname = 'soroban_events';
+   ```
+   Then create the next two partitions (add a buffer, not just one):
+   ```sql
+   SELECT create_soroban_partition(<last_upper>, <last_upper + 2000000>);
+   SELECT create_soroban_partition(<last_upper + 2000000>, <last_upper + 4000000>);
+   ```
+2. **Verify the partition was created:**
+   ```sql
+   SELECT relname FROM pg_class
+   WHERE relname LIKE 'soroban_events_p%'
+   ORDER BY relname DESC LIMIT 5;
+   ```
+3. **Restart the indexer** (it halted with a Fatal error; it will not recover
+   on its own). The cursor is persisted in `system_state` so restart resumes
+   from exactly where it stopped — no data loss, no re-index required.
+4. **Confirm** `trident_indexer_partition_lookahead_ledgers` is positive and
+   rising after the restart.
+5. Check whether any events landed in `soroban_events_default` during any
+   window when the guard was not in effect (pre-#525). If rows exist there,
+   they must be migrated into the correct named partition:
+   ```sql
+   -- Inspect what is in the default partition
+   SELECT MIN(ledger_sequence), MAX(ledger_sequence), COUNT(*)
+   FROM soroban_events_default;
+   -- If rows exist and the correct named partition now covers the range,
+   -- move them:
+   INSERT INTO soroban_events
+   SELECT * FROM soroban_events_default
+   ON CONFLICT DO NOTHING;
+   DELETE FROM soroban_events_default;
+   ```
 
 ---
 
@@ -554,3 +763,64 @@ those, so it fires on the level rather than the slope.
    gone: `SELECT pg_drop_replication_slot('<name>');`
 3. If it is ordinary growth, treat it as
    `TridentDiskFillingWithin48Hours` above.
+
+## TridentIndexerPersistDeadLetterBacklog
+
+**Means:** `failed_events` has pending rows — at least one event decoded
+fine but its database commit kept failing through the whole-page retry, the
+per-event isolation retry, and its backoff budget, so the streamer captured
+the failing event (full payload + error message), counted it on
+`trident_indexer_persist_dead_lettered_total`, and advanced the cursor past
+it (issues #208/#508). The data is safe but missing from `soroban_events`
+until replayed.
+
+**Why this threshold:** any pending row at all means indexed data is
+incomplete, and rows leave the pending state only through the replay
+procedure below — so the alert stays up until the gap is actually closed. A
+silent DLQ is the same as data loss. `for: 5m` only absorbs scrape jitter.
+Pending rows are unique per event (migration 0030): the gauge counts
+distinct poisoned events, not retry bursts.
+
+**First steps:**
+
+1. Inspect the queue:
+
+   ```sql
+   SELECT contract_id, ledger_sequence, error_message, attempts, occurred_at
+   FROM failed_events WHERE replayed_at IS NULL ORDER BY occurred_at;
+   ```
+
+   `error_message` names the exact commit error, updated to the most recent
+   failure; `attempts` accumulates across redeliveries.
+2. Fix the underlying cause (a malformed field failing column conversion, a
+   constraint interaction, …). The failure survived the whole retry budget,
+   so replaying before the fix will just fail again.
+3. **Replay** once the fix is deployed: re-ingest the affected range with
+   the backfill CLI (idempotent — `ON CONFLICT DO NOTHING` absorbs the
+   events that did commit). Note its scope: backfill restores rows in
+   `soroban_events` only — it does not write outbox rows or token
+   projections, so replayed events are not delivered to Redis/webhook
+   subscribers and do not appear in `token_events`. Acceptable for
+   historical repair, but know what you are and are not restoring:
+
+   ```
+   trident-backfill --from-ledger <min> --to-ledger <max> [--contract <id>]
+   ```
+
+   using `SELECT MIN(ledger_sequence), MAX(ledger_sequence) FROM
+   failed_events WHERE replayed_at IS NULL;` for the range.
+4. Verify the events landed, then mark the rows replayed — this is what
+   resolves the alert (rows are kept as history, never deleted):
+
+   ```sql
+   UPDATE failed_events d
+   SET replayed_at = NOW()
+   FROM soroban_events e
+   WHERE d.replayed_at IS NULL
+     AND e.ledger_sequence = d.ledger_sequence
+     AND e.transaction_hash = d.transaction_hash
+     AND e.event_index = d.event_index;
+   ```
+
+   The gauge refreshes on the next active poll cycle; the alert clears once
+   no pending rows remain.
