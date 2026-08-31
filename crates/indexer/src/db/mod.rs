@@ -719,6 +719,111 @@ pub async fn get_cursor(pool: &PgPool) -> Result<u64, TridentError> {
         .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("cursor parse")))
 }
 
+/// Fetch recent ledger sequences and hashes from `ledger_metadata` ordered by sequence descending.
+/// Used for reorg detection (issue #196).
+pub async fn get_recent_ledger_metadata(
+    pool: &PgPool,
+    limit: i64,
+) -> Result<Vec<(u64, String)>, TridentError> {
+    let rows: Vec<(i64, String)> = sqlx::query_as(
+        r#"
+        SELECT ledger_sequence, ledger_hash
+        FROM ledger_metadata
+        ORDER BY ledger_sequence DESC
+        LIMIT $1
+        "#,
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| {
+        TridentError::storage(anyhow::Error::new(e).context("get_recent_ledger_metadata"))
+    })?;
+
+    Ok(rows
+        .into_iter()
+        .map(|(seq, hash)| (seq as u64, hash))
+        .collect())
+}
+
+/// Atomically remove all indexed data from `from_sequence` onwards and rewind the cursor to `new_cursor` (issue #196).
+pub async fn handle_reorg_rollback(
+    pool: &PgPool,
+    from_sequence: u64,
+    new_cursor: u64,
+) -> Result<(), TridentError> {
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("reorg begin tx")))?;
+
+    let seq_i64 = from_sequence as i64;
+
+    // Delete token projections first (foreign key / dependent rows)
+    sqlx::query("DELETE FROM token_events WHERE ledger_sequence >= $1")
+        .bind(seq_i64)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| {
+            TridentError::storage(anyhow::Error::new(e).context("reorg delete token_events"))
+        })?;
+
+    // Delete invocation metrics
+    sqlx::query("DELETE FROM contract_invocation_metrics WHERE ledger_sequence >= $1")
+        .bind(seq_i64)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| {
+            TridentError::storage(
+                anyhow::Error::new(e).context("reorg delete contract_invocation_metrics"),
+            )
+        })?;
+
+    // Delete storage snapshots
+    sqlx::query("DELETE FROM contract_storage_snapshots WHERE ledger_sequence >= $1")
+        .bind(seq_i64)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| {
+            TridentError::storage(
+                anyhow::Error::new(e).context("reorg delete contract_storage_snapshots"),
+            )
+        })?;
+
+    // Delete primary soroban events
+    sqlx::query("DELETE FROM soroban_events WHERE ledger_sequence >= $1")
+        .bind(seq_i64)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| {
+            TridentError::storage(anyhow::Error::new(e).context("reorg delete soroban_events"))
+        })?;
+
+    // Delete ledger metadata
+    sqlx::query("DELETE FROM ledger_metadata WHERE ledger_sequence >= $1")
+        .bind(seq_i64)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| {
+            TridentError::storage(anyhow::Error::new(e).context("reorg delete ledger_metadata"))
+        })?;
+
+    // Rewind cursor in system_state
+    sqlx::query(
+        "UPDATE system_state SET value = $1, updated_at = NOW() WHERE key = 'latest_ledger_cursor'",
+    )
+    .bind(new_cursor.to_string())
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("reorg rewind cursor")))?;
+
+    tx.commit()
+        .await
+        .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("reorg commit tx")))?;
+
+    Ok(())
+}
+
 /// Write indexer health metrics into the `system_state` health columns after
 /// every successful poll cycle (issue #62).
 ///
@@ -942,6 +1047,77 @@ pub async fn insert_parse_error(
     Ok(())
 }
 
+/// Dead-letter a well-formed event that repeatedly failed to persist into
+/// `soroban_events` (issue #208).
+///
+/// Unlike `insert_parse_error`, `event` here decoded successfully — the
+/// failure is in the storage layer, not the XDR. The full event is stored as
+/// JSONB so it can be inspected and replayed once the underlying cause (a
+/// constraint violation, an outage that outlasted the retry budget, etc.) is
+/// understood, without needing to re-fetch it from Stellar RPC.
+///
+/// Keyed over PENDING rows by the event's natural key — the same
+/// (contract_id, ledger_sequence, event_index) triple `event_uuid` and
+/// migration 0025 make canonical (issue #508): a poison
+/// event re-encountered across polls — an RPC redelivery, a backfill overlap
+/// — updates its existing row (attempt count folded in, latest error kept)
+/// instead of accumulating duplicates, so the pending row count equals the
+/// number of distinct poisoned events, which is exactly what the backlog
+/// gauge and its alert report. A row an operator already replayed is history
+/// and does not block recording a fresh failure of the same event.
+pub async fn insert_failed_event(
+    pool: &PgPool,
+    event: &SorobanEvent,
+    error_message: &str,
+    attempts: u32,
+) -> Result<(), TridentError> {
+    let payload = serde_json::to_value(event).map_err(|e| {
+        TridentError::storage(anyhow::Error::new(e).context("failed_events serialise"))
+    })?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO failed_events
+            (ledger_sequence, contract_id, transaction_hash, event_index,
+             event_payload, error_message, attempts)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        ON CONFLICT (contract_id, ledger_sequence, event_index) WHERE replayed_at IS NULL
+        DO UPDATE SET
+            attempts      = failed_events.attempts + EXCLUDED.attempts,
+            error_message = EXCLUDED.error_message
+        "#,
+    )
+    .bind(event.ledger_sequence as i64)
+    .bind(&event.contract_id)
+    .bind(&event.transaction_hash)
+    .bind(event.event_index as i32)
+    .bind(payload)
+    .bind(error_message)
+    .bind(attempts as i32)
+    .execute(pool)
+    .await
+    .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("insert_failed_event")))?;
+
+    Ok(())
+}
+
+/// Number of dead-lettered events still awaiting replay. Published as the
+/// `trident_indexer_persist_dead_letter_backlog` gauge each active poll
+/// cycle (and on every dead-letter write), so the non-empty-DLQ alert has a
+/// live series to fire on — a silent queue is indistinguishable from data
+/// loss (issue #508). Counts only pending rows: a replayed row is resolved
+/// history, not backlog.
+pub async fn count_pending_failed_events(pool: &PgPool) -> Result<i64, TridentError> {
+    let row: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM failed_events WHERE replayed_at IS NULL")
+            .fetch_one(pool)
+            .await
+            .map_err(|e| {
+                TridentError::storage(anyhow::Error::new(e).context("count_pending_failed_events"))
+            })?;
+    Ok(row.0)
+}
+
 /// Contracts among `contract_ids` whose `token_metadata` row is still fresh
 /// (resolved or refreshed since `cutoff`), for either a positive or a cached
 /// negative ("not a token") result (issue #263). Contracts absent from this
@@ -1049,6 +1225,79 @@ mod tests {
         let a = event_uuid("CABC", 100, 0);
         let b = event_uuid("CABC", 100, 1);
         assert_ne!(a, b);
+    }
+
+    /// Dead-lettering the same event twice must collapse to ONE pending row
+    /// with the attempt counts folded together (issue #508) — the pending
+    /// count is what the backlog gauge reports, and it must mean "distinct
+    /// poisoned events", not "retry bursts".
+    ///
+    /// Uses the shared test database (TEST_DATABASE_URL) like the other
+    /// integration tests; skips when it is not configured.
+    #[tokio::test]
+    async fn failed_event_redelivery_updates_one_pending_row() {
+        let db_url = match std::env::var("TEST_DATABASE_URL") {
+            Ok(url) => url,
+            Err(_) if std::env::var("REQUIRE_TEST_SERVICES").is_ok() => {
+                panic!("TEST_DATABASE_URL must be set when REQUIRE_TEST_SERVICES is set");
+            }
+            Err(_) => {
+                eprintln!("SKIP: TEST_DATABASE_URL not set");
+                return;
+            }
+        };
+        let pool = PgPool::connect(&db_url).await.unwrap();
+
+        // A unique contract per run, like the other failed_events test: the
+        // shared fixture reuses one transaction hash everywhere, so scoping
+        // by contract keeps parallel tests out of each other's rows.
+        let contract_id = format!("CDLQ_{}", Uuid::new_v4());
+        let event = make_event(&contract_id, 43, 0);
+        sqlx::query("DELETE FROM failed_events WHERE contract_id = $1")
+            .bind(&contract_id)
+            .execute(&pool)
+            .await
+            .expect("cleanup failed");
+
+        insert_failed_event(&pool, &event, "first failure", 4)
+            .await
+            .expect("first dead-letter failed");
+        insert_failed_event(&pool, &event, "second failure", 4)
+            .await
+            .expect("redelivered dead-letter must not error");
+
+        let (rows, attempts, error): (i64, i32, String) = sqlx::query_as(
+            "SELECT COUNT(*) OVER (), attempts, error_message FROM failed_events              WHERE contract_id = $1 AND replayed_at IS NULL",
+        )
+        .bind(&contract_id)
+        .fetch_one(&pool)
+        .await
+        .expect("row query failed");
+        assert_eq!(rows, 1, "redelivery must update, not duplicate");
+        assert_eq!(attempts, 8, "attempt counts fold together");
+        assert_eq!(error, "second failure", "latest error wins");
+
+        // A REPLAYED row is history: the same event failing again gets a
+        // fresh pending row rather than resurrecting the resolved one.
+        sqlx::query("UPDATE failed_events SET replayed_at = NOW() WHERE transaction_hash = $1")
+            .bind(&event.transaction_hash)
+            .execute(&pool)
+            .await
+            .expect("mark replayed");
+        insert_failed_event(&pool, &event, "regression after replay", 1)
+            .await
+            .expect("post-replay dead-letter failed");
+        let pending: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM failed_events              WHERE contract_id = $1 AND replayed_at IS NULL",
+        )
+        .bind(&contract_id)
+        .fetch_one(&pool)
+        .await
+        .expect("pending count failed");
+        assert_eq!(
+            pending.0, 1,
+            "a replayed row must not block a fresh failure"
+        );
     }
 
     /// Committing the same event twice must not error and the row count in
@@ -1748,5 +1997,60 @@ mod tests {
             count.0, 0,
             "no row must have been written: the guard must fire before commit_page"
         );
+    }
+
+    /// A dead-lettered event must land in `failed_events` with its full
+    /// payload and error message intact, so it can be inspected and replayed
+    /// later (issue #208).
+    #[tokio::test]
+    async fn insert_failed_event_persists_payload_and_error() {
+        let db_url = match std::env::var("TEST_DATABASE_URL") {
+            Ok(url) => url,
+            Err(_) if std::env::var("REQUIRE_TEST_SERVICES").is_ok() => {
+                panic!("TEST_DATABASE_URL must be set when REQUIRE_TEST_SERVICES is set");
+            }
+            Err(_) => {
+                eprintln!("SKIP: TEST_DATABASE_URL not set");
+                return;
+            }
+        };
+        let pool = PgPool::connect(&db_url).await.unwrap();
+
+        let contract_id = format!("CFAILED_{}", Uuid::new_v4());
+        let event = make_event(&contract_id, 999, 0);
+
+        sqlx::query("DELETE FROM failed_events WHERE contract_id = $1")
+            .bind(&contract_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        insert_failed_event(&pool, &event, "simulated persistent failure", 3)
+            .await
+            .expect("insert_failed_event must succeed");
+
+        let row: (String, String, i32, serde_json::Value) = sqlx::query_as(
+            "SELECT error_message, transaction_hash, attempts, event_payload
+             FROM failed_events WHERE contract_id = $1",
+        )
+        .bind(&contract_id)
+        .fetch_one(&pool)
+        .await
+        .expect("row must exist");
+
+        assert_eq!(row.0, "simulated persistent failure");
+        assert_eq!(row.1, event.transaction_hash);
+        assert_eq!(row.2, 3);
+        assert_eq!(
+            row.3.get("contract_id").and_then(|v| v.as_str()),
+            Some(contract_id.as_str()),
+            "event_payload must round-trip the full event"
+        );
+
+        sqlx::query("DELETE FROM failed_events WHERE contract_id = $1")
+            .bind(&contract_id)
+            .execute(&pool)
+            .await
+            .unwrap();
     }
 }

@@ -196,6 +196,11 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	go ws.StartConsumer(ctx, redisClient, hub)
+	// Best-effort cache invalidation (issue #221): bumps a contract's cache
+	// version the moment a new event for it arrives, so ResponseCache-wrapped
+	// endpoints (contract spec/schema below) stop serving stale responses
+	// immediately rather than waiting out their TTL.
+	go middleware.StartCacheInvalidator(ctx, redisClient, ws.StreamKey)
 
 	// Start API-key usage tracker (issue #139). Flushes request_count /
 	// last_used_at to postgres in batches every 5s so auth never blocks.
@@ -285,31 +290,10 @@ func main() {
 	handlers.SetInternalStatusDeps(pool, redisClient, hub)
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /v1/health", handlers.Health())
-	mux.HandleFunc("GET /v1/ready", handlers.Ready(healthDB, redisClient, grpcClient))
-	mux.HandleFunc("GET /v1/version", handlers.VersionHandler(pool))
-	mux.HandleFunc("GET /v1/events", handlers.ListEvents)
-	mux.HandleFunc("POST /v1/events/batch", handlers.BatchGetEvents)
-	mux.HandleFunc("GET /v1/events/{id}", handlers.GetEvent)
-	mux.HandleFunc("GET /v1/events/stream", handlers.Stream(redisClient))
-	mux.HandleFunc("GET /v1/admin/db", handlers.AdminDB(adminCfg))
-	mux.HandleFunc("GET /v1/admin/keys/{id}/usage", handlers.AdminKeyUsage(adminCfg))
-	// Admin contract registration CRUD (issue #230)
-	contractCfg := handlers.ContractConfig{AdminKey: os.Getenv("ADMIN_API_KEY"), DB: pool}
-	mux.HandleFunc("POST /v1/admin/contracts", handlers.CreateContract(contractCfg))
-	mux.HandleFunc("GET /v1/admin/contracts", handlers.ListContracts(contractCfg))
-	mux.HandleFunc("DELETE /v1/admin/contracts/{id}", handlers.DeleteContract(contractCfg))
-	// API key management (admin-only via X-Admin-Key header)
-	mux.HandleFunc("POST /v1/api-keys", handlers.CreateAPIKey(apiKeyCfg))
-	mux.HandleFunc("GET /v1/api-keys", handlers.ListAPIKeys(apiKeyCfg))
-	mux.HandleFunc("PATCH /v1/api-keys/{id}", handlers.UpdateAPIKey(apiKeyCfg))
-	mux.HandleFunc("DELETE /v1/api-keys/{id}", handlers.DeleteAPIKey(apiKeyCfg))
-	mux.HandleFunc("GET /v1/stats/indexer", handlers.IndexerStats(healthDB))
-	mux.HandleFunc("GET /v1/contracts/{id}/events/schema", handlers.ContractEventSchemas(schemaRegistryDB))
-	mux.HandleFunc("GET /v1/contracts/{id}/spec", handlers.ContractSpec(schemaRegistryDB))
-	mux.HandleFunc("GET /v1/contracts/{id}/storage", handlers.ContractStorageLatest(schemaRegistryDB))
-	mux.HandleFunc("GET /v1/contracts/{id}/storage/history", handlers.ContractStorageHistory(schemaRegistryDB))
-	mux.HandleFunc("GET /v1/stats/contracts", handlers.ContractsStats(pool, redisClient))
+	// Route registration lives in routes.go as a single table shared with the
+	// OpenAPI inventory contract test (issue #513): every route is either
+	// documented in api/openapi.yaml or carries an explicit exemption, and the
+	// test fails on any drift in either direction.
 	// nil (untyped) when STELLAR_RPC_URL is unset, so CallContract's `rpc ==
 	// nil` check reports 503 rather than a typed-nil interface slipping
 	// through and panicking on first use.
@@ -317,24 +301,6 @@ func main() {
 	if rpcURL := os.Getenv("STELLAR_RPC_URL"); rpcURL != "" {
 		sorobanCaller = sorobanrpc.NewClient(rpcURL)
 	}
-	mux.HandleFunc("POST /v1/contracts/{id}/call", handlers.CallContract(sorobanCaller))
-	mux.HandleFunc("GET /v1/webhooks", listWebhooksHandler(webhookDB))
-	mux.HandleFunc("POST /v1/webhooks", createWebhookHandler(webhookDB))
-	mux.HandleFunc("DELETE /v1/webhooks/{id}", deleteWebhookHandler(webhookDB))
-	mux.HandleFunc("PATCH /v1/webhooks/{id}/pause", pauseWebhookHandler(webhookDB))
-	mux.HandleFunc("PATCH /v1/webhooks/{id}/resume", resumeWebhookHandler(webhookDB))
-	mux.HandleFunc("GET /v1/webhooks/{id}/deliveries", deliveriesWebhookHandler(webhookDB))
-	mux.HandleFunc("GET /v1/webhooks/{id}/dead-letters", deadLettersWebhookHandler(webhookDB))
-	mux.HandleFunc("POST /v1/webhooks/{id}/dead-letters/{deliveryId}/replay", replayDeadLetterHandler(webhookDB))
-	mux.HandleFunc("POST /v1/webhooks/{id}/rotate-secret", rotateWebhookSecretHandler(webhookDB))
-	mux.HandleFunc("GET /metrics", handlers.MetricsHandler(pool, redisClient))
-	mux.HandleFunc("GET /internal/status", handlers.InternalStatus())
-	mux.Handle("/ws", middleware.WSConnectionLimit(ws.Handler(hub)))
-	keyValidator := middleware.Validator(middleware.ParseKeyHashes(os.Getenv("API_KEY_HASHES")))
-	mux.Handle("/graphql", middleware.WSConnectionLimit(ws.GraphQLHandler(hub, keyValidator)))
-
-	_ = usageTrack // passed to middleware in future; declared for shutdown ordering
-
 	var rlDB middleware.TierDB
 	if pool != nil {
 		rlDB = pool
@@ -347,6 +313,25 @@ func main() {
 		authDB.DB = pool
 	}
 	authDB.Redis = redisClient
+
+	registerRoutes(mux, routeDeps{
+		rlCfg:            rlCfg,
+		authDB:           authDB,
+		pool:             pool,
+		healthDB:         healthDB,
+		schemaRegistryDB: schemaRegistryDB,
+		redisClient:      redisClient,
+		grpcClient:       grpcClient,
+		adminCfg:         adminCfg,
+		contractCfg:      handlers.ContractConfig{AdminKey: os.Getenv("ADMIN_API_KEY"), DB: pool},
+		apiKeyCfg:        apiKeyCfg,
+		sorobanCaller:    sorobanCaller,
+		webhookDB:        webhookDB,
+		hub:              hub,
+		keyValidator:     middleware.Validator(middleware.ParseKeyHashes(os.Getenv("API_KEY_HASHES"))),
+	})
+
+	_ = usageTrack // passed to middleware in future; declared for shutdown ordering
 
 	handler := middleware.NewBodySizeLimitFromEnv()(mux)
 	handler = middleware.TieredRateLimit(rlCfg)(handler)
@@ -368,7 +353,7 @@ func main() {
 	// X-Request-ID, and is captured in structured logs (issue #226). RequestID
 	// must precede StructuredLogging so the id is in context when the log line
 	// is emitted.
-	handler = middleware.Chain(handler, middleware.RequestID, middleware.StructuredLogging)
+	handler = middleware.Chain(handler, middleware.RequestID, middleware.StructuredLogging(mux))
 	// Global concurrency cap is the outermost middleware of all (issue #318):
 	// it must shed load before any other work — auth lookups, rate-limit
 	// Redis calls, logging — is spent on a request that's going to be

@@ -21,6 +21,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Depo-dev/trident/services/api/cursor"
 	"github.com/Depo-dev/trident/services/api/handlers"
 	"github.com/Depo-dev/trident/services/api/internal/httputil"
 	"github.com/Depo-dev/trident/services/api/internal/metrics"
@@ -31,6 +32,14 @@ import (
 )
 
 const maxWebhookAttempts = 5
+
+// webhookListDefaultLimit/webhookListMaxLimit bound GET /v1/webhooks
+// pagination (issue #220) — same shape as ListAPIKeys/ListContracts/
+// ListEvents.
+const (
+	webhookListDefaultLimit = 50
+	webhookListMaxLimit     = 200
+)
 
 type webhookSubscription struct {
 	ID         string  `json:"id"`
@@ -80,22 +89,32 @@ type webhookDelivery struct {
 	Success        bool      `json:"success"`
 }
 
-func resolveAPIKeyID(ctx context.Context, db *sql.DB, r *http.Request) (string, error) {
-	if db == nil {
-		return "", nil
+// resolveAPIKeyID returns the authenticated API key's UUID, which
+// middleware.NewDBAuth resolved and attached to the request context.
+//
+// It previously interpreted the raw X-API-Key HEADER as an api_keys.id UUID
+// — which no real key ever is, since keys are "trident_<hex>" strings — and
+// then fell back to `INSERT INTO api_keys DEFAULT VALUES`, which violates
+// the table's NOT NULL constraints. Every legitimate caller therefore got a
+// 500 before reaching a subscription, making the documented list/create
+// happy paths unreachable (caught while bringing these routes under the
+// OpenAPI contract test, issue #513).
+//
+// Legacy env-hash keys have no database identity and cannot own webhook
+// subscriptions; that is now an explicit auth error instead of a stray row
+// insert.
+func resolveAPIKeyID(ctx context.Context) (string, error) {
+	if id := middleware.APIKeyIDFromContext(ctx); id != "" {
+		return id, nil
 	}
-	if header := strings.TrimSpace(r.Header.Get("X-API-Key")); header != "" {
-		var id string
-		if err := db.QueryRowContext(ctx, `SELECT id FROM api_keys WHERE id = $1`, header).Scan(&id); err == nil {
-			return id, nil
-		}
-	}
-	var id string
-	if err := db.QueryRowContext(ctx, `INSERT INTO api_keys DEFAULT VALUES RETURNING id`).Scan(&id); err != nil {
-		return "", err
-	}
-	return id, nil
+	return "", errAPIKeyNotResolvable
 }
+
+// errAPIKeyNotResolvable marks a request authenticated without a
+// database-backed API key (legacy env-hash auth).
+var errAPIKeyNotResolvable = errors.New(
+	"webhook ownership requires a database-backed API key",
+)
 
 type webhookDeliveryResult struct {
 	Success      bool
@@ -531,23 +550,72 @@ func truncateString(input string, max int) string {
 	return input[:max]
 }
 
+// listWebhooksResponse is the response envelope for GET /v1/webhooks (issue
+// #220) — the same has_more/next_cursor shape as ListEventsResponse/
+// ListAPIKeysResponse, so every keyset-paginated list endpoint in this API
+// is walked the same way. Previously a bare JSON array with no pagination
+// at all: a caller with enough subscriptions had no way to fetch them in
+// bounded pages.
+type listWebhooksResponse struct {
+	Webhooks   []webhookSubscription `json:"webhooks"`
+	HasMore    bool                  `json:"has_more"`
+	NextCursor *string               `json:"next_cursor"`
+}
+
 func listWebhooksHandler(db *sql.DB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if db == nil {
 			http.Error(w, "database unavailable", http.StatusServiceUnavailable)
 			return
 		}
-		apiKeyID, err := resolveAPIKeyID(r.Context(), db, r)
+		apiKeyID, err := resolveAPIKeyID(r.Context())
+		if errors.Is(err, errAPIKeyNotResolvable) {
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusUnauthorized, httputil.UNAUTHORIZED, err.Error())
+			return
+		}
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
+
+		if verr := validation.RejectUnknownParams(r.URL.Query(), "limit", "cursor"); verr != nil {
+			http.Error(w, verr.Message, http.StatusBadRequest)
+			return
+		}
+
+		limit := webhookListDefaultLimit
+		if l := r.URL.Query().Get("limit"); l != "" {
+			n, err := strconv.Atoi(l)
+			if err != nil || n <= 0 || n > webhookListMaxLimit {
+				http.Error(w, fmt.Sprintf("limit must be an integer between 1 and %d", webhookListMaxLimit), http.StatusBadRequest)
+				return
+			}
+			limit = n
+		}
+
+		// created_at is not unique on its own, so the keyset is
+		// (created_at, id) — a total order with id as tiebreaker — not
+		// created_at alone (issue #220), same reasoning as ListAPIKeys.
+		var cursorCreatedAt, cursorID any
+		if c := r.URL.Query().Get("cursor"); c != "" {
+			t, id, err := cursor.DecodeKeyset(c)
+			if err != nil {
+				http.Error(w, "cursor is not a valid pagination cursor", http.StatusBadRequest)
+				return
+			}
+			cursorCreatedAt, cursorID = t, id
+		}
+
+		// LIMIT $4 fetches one extra row past the page: its presence is how
+		// has_more is known without a separate COUNT query.
 		rows, err := db.QueryContext(r.Context(), `
 			SELECT id, api_key_id, contract_id, topic0, target_url, secret, secondary_secret, created_at, paused_at, network
 			FROM webhook_subscriptions
 			WHERE api_key_id = $1
-			ORDER BY created_at DESC
-		`, apiKeyID)
+			  AND ($2::timestamptz IS NULL OR (created_at, id) < ($2::timestamptz, $3::uuid))
+			ORDER BY created_at DESC, id DESC
+			LIMIT $4
+		`, apiKeyID, cursorCreatedAt, cursorID, limit+1)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -577,7 +645,27 @@ func listWebhooksHandler(db *sql.DB) http.HandlerFunc {
 			// once, at rotation time.
 			subscriptions = append(subscriptions, sub)
 		}
-		writeJSON(w, http.StatusOK, subscriptions)
+		if subscriptions == nil {
+			subscriptions = []webhookSubscription{}
+		}
+
+		hasMore := len(subscriptions) > limit
+		if hasMore {
+			subscriptions = subscriptions[:limit]
+		}
+
+		var nextCursor *string
+		if hasMore {
+			last := subscriptions[len(subscriptions)-1]
+			c := cursor.EncodeKeyset(last.CreatedAt, last.ID)
+			nextCursor = &c
+		}
+
+		writeJSON(w, http.StatusOK, listWebhooksResponse{
+			Webhooks:   subscriptions,
+			HasMore:    hasMore,
+			NextCursor: nextCursor,
+		})
 	}
 }
 
@@ -617,7 +705,11 @@ func createWebhookHandler(db *sql.DB) http.HandlerFunc {
 			http.Error(w, "failed to generate webhook secret", http.StatusInternalServerError)
 			return
 		}
-		apiKeyID, err := resolveAPIKeyID(r.Context(), db, r)
+		apiKeyID, err := resolveAPIKeyID(r.Context())
+		if errors.Is(err, errAPIKeyNotResolvable) {
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusUnauthorized, httputil.UNAUTHORIZED, err.Error())
+			return
+		}
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -921,7 +1013,15 @@ func rotateWebhookSecretHandler(db *sql.DB) http.HandlerFunc {
 		// Rotation must be scoped to the caller's API key. Without this an
 		// authenticated caller could rotate any other tenant's webhook secret
 		// and read both the old and new values back.
-		apiKeyID, err := resolveAPIKeyID(r.Context(), db, r)
+		apiKeyID, err := resolveAPIKeyID(r.Context())
+		if errors.Is(err, errAPIKeyNotResolvable) {
+			// Same canonical contract as webhook creation: legacy env-hash
+			// auth carries no key identity to scope ownership to, and an
+			// unresolvable key is the caller's auth mode, not a server
+			// fault — 401, never a 500.
+			httputil.WriteErrorCtx(r.Context(), w, http.StatusUnauthorized, httputil.UNAUTHORIZED, err.Error())
+			return
+		}
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return

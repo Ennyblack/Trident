@@ -33,6 +33,16 @@ pub const PARSE_ERRORS_TOTAL: &str = "trident_indexer_parse_errors_total";
 /// including ones that later succeed on retry: this counter only moves when an
 /// event is actually abandoned, which is what an alert should fire on.
 pub const DEAD_LETTERED_TOTAL: &str = "trident_indexer_dead_lettered_total";
+/// Deliberately separate from DEAD_LETTERED_TOTAL above: that one counts
+/// undecodable events captured in `parse_errors` (a poison message — retry
+/// never helps), while this counts well-formed events whose database commit
+/// failed after the retry budget and landed in `failed_events` for replay
+/// (issue #508). Conflating them made one number answer two different
+/// operational questions.
+pub const PERSIST_DEAD_LETTERED_TOTAL: &str = "trident_indexer_persist_dead_lettered_total";
+/// Current number of `failed_events` rows awaiting replay. Non-empty pages
+/// via TridentIndexerPersistDeadLetterBacklog (monitoring/alerts.yml).
+pub const PERSIST_DEAD_LETTER_BACKLOG: &str = "trident_indexer_persist_dead_letter_backlog";
 pub const POLL_DURATION_SECONDS: &str = "trident_indexer_poll_duration_seconds";
 pub const POLL_ERRORS_TOTAL: &str = "trident_indexer_poll_errors_total";
 pub const RPC_RETRIES_TOTAL: &str = "trident_indexer_rpc_retries_total";
@@ -40,11 +50,35 @@ pub const EFFECTIVE_POLL_INTERVAL_MS: &str = "trident_indexer_effective_poll_int
 pub const RPC_TIMEOUTS_TOTAL: &str = "trident_indexer_rpc_timeouts_total";
 pub const RPC_ACTIVE_ENDPOINT: &str = "trident_indexer_rpc_active_endpoint";
 pub const RPC_FAILOVERS_TOTAL: &str = "trident_indexer_rpc_failovers_total";
-/// Count of ScVal values that hit the catch-all / debug-format fallback in
-/// `scval_to_string` or `scval_to_json` (issue #415). A high rate means the
-/// indexer is encountering Soroban types it cannot render as structured data.
-pub const UNHANDLED_SCVARIANT_TOTAL: &str = "trident_indexer_unhandled_scvariant_total";
+/// Count of structurally valid ScVal variants decoded from event payloads
+/// where they should never legitimately appear (`ContractInstance`,
+/// `LedgerKeyContractInstance`, `LedgerKeyNonce`). Emitted by the shared
+/// decoder in `trident_common::scval` (issue #506, superseding the #415
+/// debug-fallback counter: the decoder no longer has a fallback — matches
+/// are exhaustive, so a new XDR variant fails compilation instead).
+pub const UNEXPECTED_SCVAL_VARIANT_TOTAL: &str =
+    trident_common::scval::UNEXPECTED_SCVAL_VARIANT_TOTAL;
+pub const REORGS_TOTAL: &str = "trident_indexer_reorgs_total";
 pub const OUTBOX_BACKLOG: &str = "trident_indexer_outbox_backlog";
+
+/// Reconciliation loop (issue #511): passes that completed a full compare of
+/// a settled ledger window against the RPC source.
+pub const RECONCILE_PASSES_TOTAL: &str = "trident_indexer_reconcile_passes_total";
+/// Passes that aborted before producing a report (RPC or DB failure). A
+/// failing reconciler reports nothing — which must never read as clean.
+pub const RECONCILE_PASS_FAILURES_TOTAL: &str = "trident_indexer_reconcile_pass_failures_total";
+/// Events the RPC reports for reconciled windows that the database does not
+/// account for — the silent-under-indexing signal this loop exists to catch.
+pub const RECONCILE_MISSING_EVENTS_TOTAL: &str = "trident_indexer_reconcile_missing_events_total";
+/// Events the database holds that the RPC does not report for the window —
+/// over-indexing, as wrong as under-indexing.
+pub const RECONCILE_EXTRA_EVENTS_TOTAL: &str = "trident_indexer_reconcile_extra_events_total";
+/// Ledgers in the most recent pass whose counts disagreed. Stays non-zero on
+/// every pass until the discrepancy is resolved, which is what the alert
+/// fires on.
+pub const RECONCILE_DISCREPANT_LEDGERS: &str = "trident_indexer_reconcile_discrepant_ledgers";
+/// Highest ledger covered by the most recent completed pass.
+pub const RECONCILE_WINDOW_END_LEDGER: &str = "trident_indexer_reconcile_window_end_ledger";
 pub const OUTBOX_PUBLISHED_TOTAL: &str = "trident_indexer_outbox_published_total";
 pub const OUTBOX_PUBLISH_FAILURES_TOTAL: &str = "trident_indexer_outbox_publish_failures_total";
 /// RPC call latency in seconds, labelled by `method` (e.g. `getEvents`) and
@@ -124,6 +158,18 @@ pub fn install(port: u16) -> Result<(), TridentError> {
         "Events skipped (diagnostic, failed call, or contract filter)"
     );
     describe_counter!(PARSE_ERRORS_TOTAL, "Total events that failed XDR decoding");
+    describe_counter!(
+        DEAD_LETTERED_TOTAL,
+        "Undecodable events durably captured in parse_errors (issue #414)"
+    );
+    describe_counter!(
+        PERSIST_DEAD_LETTERED_TOTAL,
+        "Well-formed events captured in failed_events after exhausting the persist retry budget (issue #508)"
+    );
+    describe_gauge!(
+        PERSIST_DEAD_LETTER_BACKLOG,
+        "failed_events rows awaiting replay; non-empty pages via TridentIndexerPersistDeadLetterBacklog (issue #508)"
+    );
     describe_histogram!(
         POLL_DURATION_SECONDS,
         "Time per poll_once cycle, in seconds"
@@ -149,6 +195,10 @@ pub fn install(port: u16) -> Result<(), TridentError> {
         RPC_FAILOVERS_TOTAL,
         "Times the indexer failed over to another RPC endpoint (issue #213)"
     );
+    describe_counter!(
+        REORGS_TOTAL,
+        "Total number of ledger reorganisations / rollbacks detected and reconciled (issue #196)"
+    );
     describe_gauge!(
         OUTBOX_BACKLOG,
         "Committed events not yet published to the Redis stream (issue #200)"
@@ -162,8 +212,32 @@ pub fn install(port: u16) -> Result<(), TridentError> {
         "Outbox publish attempts that failed (issue #200)"
     );
     describe_counter!(
-        UNHANDLED_SCVARIANT_TOTAL,
-        "ScVal values that hit the debug-format fallback (issue #415)"
+        UNEXPECTED_SCVAL_VARIANT_TOTAL,
+        "ScVal variants decoded from event payloads where they should never appear (issue #506)"
+    );
+    describe_counter!(
+        RECONCILE_PASSES_TOTAL,
+        "Reconciliation passes that completed a full window compare (issue #511)"
+    );
+    describe_counter!(
+        RECONCILE_PASS_FAILURES_TOTAL,
+        "Reconciliation passes that aborted before producing a report (issue #511)"
+    );
+    describe_counter!(
+        RECONCILE_MISSING_EVENTS_TOTAL,
+        "Events on the RPC source that the database does not account for (issue #511)"
+    );
+    describe_counter!(
+        RECONCILE_EXTRA_EVENTS_TOTAL,
+        "Events in the database that the RPC source does not report (issue #511)"
+    );
+    describe_gauge!(
+        RECONCILE_DISCREPANT_LEDGERS,
+        "Ledgers in the most recent reconciliation pass with disagreeing counts (issue #511)"
+    );
+    describe_gauge!(
+        RECONCILE_WINDOW_END_LEDGER,
+        "Highest ledger covered by the most recent completed reconciliation pass (issue #511)"
     );
     describe_gauge!(
         HEARTBEAT_TIMESTAMP,
@@ -213,7 +287,16 @@ pub fn install(port: u16) -> Result<(), TridentError> {
     counter!(RPC_FAILOVERS_TOTAL).increment(0);
     counter!(OUTBOX_PUBLISHED_TOTAL).increment(0);
     counter!(OUTBOX_PUBLISH_FAILURES_TOTAL).increment(0);
-    counter!(UNHANDLED_SCVARIANT_TOTAL).increment(0);
+    counter!(UNEXPECTED_SCVAL_VARIANT_TOTAL).increment(0);
+    counter!(PERSIST_DEAD_LETTERED_TOTAL).increment(0);
+    gauge!(PERSIST_DEAD_LETTER_BACKLOG).set(0.0);
+    counter!(DEAD_LETTERED_TOTAL).increment(0);
+    counter!(RECONCILE_PASSES_TOTAL).increment(0);
+    counter!(RECONCILE_PASS_FAILURES_TOTAL).increment(0);
+    counter!(RECONCILE_MISSING_EVENTS_TOTAL).increment(0);
+    counter!(RECONCILE_EXTRA_EVENTS_TOTAL).increment(0);
+    gauge!(RECONCILE_DISCREPANT_LEDGERS).set(0.0);
+    gauge!(RECONCILE_WINDOW_END_LEDGER).set(0.0);
     gauge!(RPC_ACTIVE_ENDPOINT).set(0.0);
     gauge!(OUTBOX_BACKLOG).set(0.0);
     gauge!(LEDGER_LAG).set(0.0);
@@ -334,12 +417,44 @@ pub fn record_parse_error() {
     counter!(PARSE_ERRORS_TOTAL).increment(1);
 }
 
+pub fn record_persist_dead_lettered() {
+    counter!(PERSIST_DEAD_LETTERED_TOTAL).increment(1);
+}
+
+pub fn set_persist_dead_letter_backlog(depth: i64) {
+    gauge!(PERSIST_DEAD_LETTER_BACKLOG).set(depth as f64);
+}
+
 pub fn record_dead_lettered() {
     counter!(DEAD_LETTERED_TOTAL).increment(1);
 }
 
-pub fn record_unhandled_scvariant() {
-    counter!(UNHANDLED_SCVARIANT_TOTAL).increment(1);
+pub fn record_reorg() {
+    counter!(REORGS_TOTAL).increment(1);
+}
+
+pub fn record_reconcile_pass_completed() {
+    counter!(RECONCILE_PASSES_TOTAL).increment(1);
+}
+
+pub fn record_reconcile_pass_failed() {
+    counter!(RECONCILE_PASS_FAILURES_TOTAL).increment(1);
+}
+
+pub fn record_reconcile_missing_events(count: u64) {
+    counter!(RECONCILE_MISSING_EVENTS_TOTAL).increment(count);
+}
+
+pub fn record_reconcile_extra_events(count: u64) {
+    counter!(RECONCILE_EXTRA_EVENTS_TOTAL).increment(count);
+}
+
+pub fn set_reconcile_discrepant_ledgers(count: i64) {
+    gauge!(RECONCILE_DISCREPANT_LEDGERS).set(count as f64);
+}
+
+pub fn set_reconcile_window_end(ledger: u64) {
+    gauge!(RECONCILE_WINDOW_END_LEDGER).set(ledger as f64);
 }
 
 pub fn record_poll_duration(seconds: f64) {
