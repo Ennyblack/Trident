@@ -558,3 +558,72 @@ CREATE TABLE IF NOT EXISTS failed_events (
 
 CREATE INDEX IF NOT EXISTS idx_failed_events_occurred_at ON failed_events (occurred_at DESC);
 CREATE INDEX IF NOT EXISTS idx_failed_events_pending ON failed_events (occurred_at) WHERE replayed_at IS NULL;
+-- Pending rows are unique per event (migration 0030): redelivered failures
+-- update in place, so COUNT(*) of pending rows = distinct poisoned events.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_failed_events_pending
+    ON failed_events (contract_id, ledger_sequence, event_index)
+    WHERE replayed_at IS NULL;
+
+
+-- ---------------------------------------------------------------------------
+-- Network value constraints  (migration 0031, issue #252)
+-- A typo such as 'testnett' silently splits the dataset in two: every query
+-- filtered on network misses those rows, and nothing errors. These CHECKs turn
+-- that into a write-time failure. Values match what the code writes -- see
+-- crates/common/src/types.rs Network.
+-- ---------------------------------------------------------------------------
+ALTER TABLE soroban_events
+    ADD CONSTRAINT chk_soroban_events_network
+    CHECK (network IN ('mainnet', 'testnet', 'futurenet', 'sandbox'));
+
+ALTER TABLE indexed_contracts
+    ADD CONSTRAINT chk_indexed_contracts_network
+    CHECK (network IS NULL OR network IN ('mainnet', 'testnet', 'futurenet', 'sandbox'));
+
+ALTER TABLE api_keys
+    ADD CONSTRAINT chk_api_keys_network
+    CHECK (network IN ('mainnet', 'testnet', 'futurenet', 'sandbox'));
+
+ALTER TABLE audit_log
+    ADD CONSTRAINT chk_audit_log_network
+    CHECK (network IS NULL OR network IN ('mainnet', 'testnet', 'futurenet', 'sandbox'));
+
+ALTER TABLE webhook_subscriptions
+    ADD CONSTRAINT chk_webhook_subscriptions_network
+    CHECK (network IN ('mainnet', 'testnet', 'futurenet', 'sandbox'));
+
+ALTER TABLE token_events
+    ADD CONSTRAINT chk_token_events_network
+    CHECK (network IN ('mainnet', 'testnet', 'futurenet', 'sandbox'));
+
+ALTER TABLE contract_invocation_metrics
+    ADD CONSTRAINT chk_contract_invocation_metrics_network
+    CHECK (network IN ('mainnet', 'testnet', 'futurenet', 'sandbox'));
+
+ALTER TABLE contract_liveness
+    ADD CONSTRAINT chk_contract_liveness_network
+    CHECK (network IN ('mainnet', 'testnet', 'futurenet', 'sandbox'));
+
+ALTER TABLE contract_verification
+    ADD CONSTRAINT chk_contract_verification_network
+    CHECK (network IN ('mainnet', 'testnet', 'futurenet', 'sandbox'));
+
+ALTER TABLE contract_specs
+    ADD CONSTRAINT chk_contract_specs_network
+    CHECK (network IN ('mainnet', 'testnet', 'futurenet', 'sandbox'));
+
+ALTER TABLE contract_stats_rollup
+    ADD CONSTRAINT chk_contract_stats_rollup_network
+    CHECK (network IN ('mainnet', 'testnet', 'futurenet', 'sandbox'));
+
+ALTER TABLE contract_event_schemas
+    ADD CONSTRAINT chk_contract_event_schemas_network
+    CHECK (network IN ('mainnet', 'testnet', 'futurenet', 'sandbox'));
+
+ALTER TABLE token_metadata
+    ADD CONSTRAINT chk_token_metadata_network
+    CHECK (network IN ('mainnet', 'testnet', 'futurenet', 'sandbox'));
+
+ALTER TABLE contract_storage_snapshots
+    ADD CONSTRAINT chk_contract_storage_snapshots_network
+    CHECK (network IN ('mainnet', 'testnet', 'futurenet', 'sandbox'));
