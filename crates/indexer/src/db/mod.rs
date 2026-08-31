@@ -719,6 +719,111 @@ pub async fn get_cursor(pool: &PgPool) -> Result<u64, TridentError> {
         .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("cursor parse")))
 }
 
+/// Fetch recent ledger sequences and hashes from `ledger_metadata` ordered by sequence descending.
+/// Used for reorg detection (issue #196).
+pub async fn get_recent_ledger_metadata(
+    pool: &PgPool,
+    limit: i64,
+) -> Result<Vec<(u64, String)>, TridentError> {
+    let rows: Vec<(i64, String)> = sqlx::query_as(
+        r#"
+        SELECT ledger_sequence, ledger_hash
+        FROM ledger_metadata
+        ORDER BY ledger_sequence DESC
+        LIMIT $1
+        "#,
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| {
+        TridentError::storage(anyhow::Error::new(e).context("get_recent_ledger_metadata"))
+    })?;
+
+    Ok(rows
+        .into_iter()
+        .map(|(seq, hash)| (seq as u64, hash))
+        .collect())
+}
+
+/// Atomically remove all indexed data from `from_sequence` onwards and rewind the cursor to `new_cursor` (issue #196).
+pub async fn handle_reorg_rollback(
+    pool: &PgPool,
+    from_sequence: u64,
+    new_cursor: u64,
+) -> Result<(), TridentError> {
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("reorg begin tx")))?;
+
+    let seq_i64 = from_sequence as i64;
+
+    // Delete token projections first (foreign key / dependent rows)
+    sqlx::query("DELETE FROM token_events WHERE ledger_sequence >= $1")
+        .bind(seq_i64)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| {
+            TridentError::storage(anyhow::Error::new(e).context("reorg delete token_events"))
+        })?;
+
+    // Delete invocation metrics
+    sqlx::query("DELETE FROM contract_invocation_metrics WHERE ledger_sequence >= $1")
+        .bind(seq_i64)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| {
+            TridentError::storage(
+                anyhow::Error::new(e).context("reorg delete contract_invocation_metrics"),
+            )
+        })?;
+
+    // Delete storage snapshots
+    sqlx::query("DELETE FROM contract_storage_snapshots WHERE ledger_sequence >= $1")
+        .bind(seq_i64)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| {
+            TridentError::storage(
+                anyhow::Error::new(e).context("reorg delete contract_storage_snapshots"),
+            )
+        })?;
+
+    // Delete primary soroban events
+    sqlx::query("DELETE FROM soroban_events WHERE ledger_sequence >= $1")
+        .bind(seq_i64)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| {
+            TridentError::storage(anyhow::Error::new(e).context("reorg delete soroban_events"))
+        })?;
+
+    // Delete ledger metadata
+    sqlx::query("DELETE FROM ledger_metadata WHERE ledger_sequence >= $1")
+        .bind(seq_i64)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| {
+            TridentError::storage(anyhow::Error::new(e).context("reorg delete ledger_metadata"))
+        })?;
+
+    // Rewind cursor in system_state
+    sqlx::query(
+        "UPDATE system_state SET value = $1, updated_at = NOW() WHERE key = 'latest_ledger_cursor'",
+    )
+    .bind(new_cursor.to_string())
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("reorg rewind cursor")))?;
+
+    tx.commit()
+        .await
+        .map_err(|e| TridentError::storage(anyhow::Error::new(e).context("reorg commit tx")))?;
+
+    Ok(())
+}
+
 /// Write indexer health metrics into the `system_state` health columns after
 /// every successful poll cycle (issue #62).
 ///

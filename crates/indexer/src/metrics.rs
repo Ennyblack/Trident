@@ -58,6 +58,7 @@ pub const RPC_FAILOVERS_TOTAL: &str = "trident_indexer_rpc_failovers_total";
 /// are exhaustive, so a new XDR variant fails compilation instead).
 pub const UNEXPECTED_SCVAL_VARIANT_TOTAL: &str =
     trident_common::scval::UNEXPECTED_SCVAL_VARIANT_TOTAL;
+pub const REORGS_TOTAL: &str = "trident_indexer_reorgs_total";
 pub const OUTBOX_BACKLOG: &str = "trident_indexer_outbox_backlog";
 
 /// Reconciliation loop (issue #511): passes that completed a full compare of
@@ -193,6 +194,10 @@ pub fn install(port: u16) -> Result<(), TridentError> {
     describe_counter!(
         RPC_FAILOVERS_TOTAL,
         "Times the indexer failed over to another RPC endpoint (issue #213)"
+    );
+    describe_counter!(
+        REORGS_TOTAL,
+        "Total number of ledger reorganisations / rollbacks detected and reconciled (issue #196)"
     );
     describe_gauge!(
         OUTBOX_BACKLOG,
@@ -422,6 +427,10 @@ pub fn set_persist_dead_letter_backlog(depth: i64) {
 
 pub fn record_dead_lettered() {
     counter!(DEAD_LETTERED_TOTAL).increment(1);
+}
+
+pub fn record_reorg() {
+    counter!(REORGS_TOTAL).increment(1);
 }
 
 pub fn record_reconcile_pass_completed() {
