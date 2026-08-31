@@ -69,8 +69,17 @@ func decodeScValJSON(v xdr.ScVal) any {
 			return fmt.Sprintf("%d", *v.Duration)
 		}
 	case xdr.ScValTypeScvError:
+		// xdr.ScError is a union with no String method of its own. Render the
+		// arm the discriminant selects: contract errors carry a numeric code,
+		// every other type carries an ScErrorCode.
 		if v.Error != nil {
-			return v.Error.String()
+			if v.Error.Type == xdr.ScErrorTypeSceContract && v.Error.ContractCode != nil {
+				return fmt.Sprintf("%s(%d)", v.Error.Type.String(), *v.Error.ContractCode)
+			}
+			if v.Error.Code != nil {
+				return fmt.Sprintf("%s(%s)", v.Error.Type.String(), v.Error.Code.String())
+			}
+			return v.Error.Type.String()
 		}
 	case xdr.ScValTypeScvBytes:
 		if v.Bytes != nil {
